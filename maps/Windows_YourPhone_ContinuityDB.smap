@@ -1,0 +1,98 @@
+Description: Windows Your Phone (Phone Link) Continuity - phone browser history and cross-device app context
+Author: whitedevil1026
+Email: 145743158+whitedevil1026@users.noreply.github.com
+Id: 8b791b3f-87af-49c5-a748-cab045d363ca
+Version: 1.0
+CSVPrefix: WindowsYourPhone
+FileName: continuity.db
+IdentifyQuery: SELECT ((SELECT count(*) FROM pragma_table_info('browser_history') WHERE name IN ('browser_history_id','package_name','browser_history_title','browser_history_rank','task_id','favicon','web_uri','source')) + (SELECT count(*) FROM pragma_table_info('continue_app_context') WHERE name IN ('id','context_id','task_id','type','team_id','intent_uri','app_id','title','web_link','preview','extras','create_time','last_updated_time','life_time'))) + (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('browser_history', 'continue_app_context'));
+IdentifyValue: 24
+Queries:
+    -
+        Name: Windows Your Phone Continuity Database Browser History
+        Query: |
+                SELECT
+                browser_history.browser_history_id AS BrowserHistoryID,
+                browser_history.browser_history_rank AS Rank,
+                browser_history.browser_history_title AS Title,
+                browser_history.web_uri AS URL,
+                browser_history.package_name AS BrowserPackageName,
+                browser_history.source AS Source,
+                browser_history.task_id AS AndroidTaskID,
+                CAST( COALESCE( browser_history.favicon, X'' ) AS BLOB ) AS Favicon
+                FROM
+                browser_history
+                ORDER BY
+                browser_history.browser_history_rank ASC
+        BaseFileName: ContinuityDB_BrowserHistory
+        BlobColumns:
+            - BlobColumn: Favicon
+              NameColumn: BrowserHistoryID
+    -
+        Name: Windows Your Phone Continuity Database Continue App Context
+        Query: |
+                SELECT
+                continue_app_context.id AS ID,
+                continue_app_context.context_id AS ContextID,
+                CASE
+
+                WHEN typeof( continue_app_context.create_time ) NOT IN ( 'integer', 'real' ) THEN
+                NULL
+                WHEN continue_app_context.create_time >= 400000000000000000 THEN
+                datetime( ( continue_app_context.create_time - 621355968000000000 ) / 10000000, 'unixepoch' )
+                WHEN continue_app_context.create_time >= 10000000000000000 THEN
+                datetime( ( continue_app_context.create_time / 10000000 ) - 11644473600, 'unixepoch' )
+                WHEN continue_app_context.create_time >= 100000000000000 THEN
+                datetime( continue_app_context.create_time / 1000000, 'unixepoch' )
+                WHEN continue_app_context.create_time >= 100000000000 THEN
+                datetime( continue_app_context.create_time / 1000, 'unixepoch' )
+                WHEN typeof( continue_app_context.create_time ) IN ( 'integer', 'real' ) AND continue_app_context.create_time > 0 THEN
+                datetime( continue_app_context.create_time, 'unixepoch' )
+                END AS CreateTimeUTC,
+                CAST( continue_app_context.create_time AS TEXT ) AS CreateTimeRaw,
+                CASE
+
+                WHEN typeof( continue_app_context.last_updated_time ) NOT IN ( 'integer', 'real' ) THEN
+                NULL
+                WHEN continue_app_context.last_updated_time >= 400000000000000000 THEN
+                datetime( ( continue_app_context.last_updated_time - 621355968000000000 ) / 10000000, 'unixepoch' )
+                WHEN continue_app_context.last_updated_time >= 10000000000000000 THEN
+                datetime( ( continue_app_context.last_updated_time / 10000000 ) - 11644473600, 'unixepoch' )
+                WHEN continue_app_context.last_updated_time >= 100000000000000 THEN
+                datetime( continue_app_context.last_updated_time / 1000000, 'unixepoch' )
+                WHEN continue_app_context.last_updated_time >= 100000000000 THEN
+                datetime( continue_app_context.last_updated_time / 1000, 'unixepoch' )
+                WHEN typeof( continue_app_context.last_updated_time ) IN ( 'integer', 'real' ) AND continue_app_context.last_updated_time > 0 THEN
+                datetime( continue_app_context.last_updated_time, 'unixepoch' )
+                END AS LastUpdatedTimeUTC,
+                CAST( continue_app_context.last_updated_time AS TEXT ) AS LastUpdatedTimeRaw,
+                CAST( continue_app_context.life_time AS TEXT ) AS LifeTimeRaw,
+                continue_app_context.type AS Type,
+                continue_app_context.app_id AS AppID,
+                continue_app_context.title AS Title,
+                continue_app_context.web_link AS WebLink,
+                continue_app_context.intent_uri AS IntentURI,
+                continue_app_context.team_id AS TeamID,
+                continue_app_context.task_id AS AndroidTaskID,
+                continue_app_context.extras AS Extras,
+                CAST( COALESCE( continue_app_context.preview, X'' ) AS BLOB ) AS Preview
+                FROM
+                continue_app_context
+                ORDER BY
+                continue_app_context.create_time ASC
+        BaseFileName: ContinuityDB_ContinueAppContext
+        BlobColumns:
+            - BlobColumn: Preview
+              NameColumn: ID
+
+# Documentation
+# continuity.db sits in %LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe\LocalCache\Indexed\<device GUID>\System\Database\
+# Tested on a current Windows 11 build (October 2026) against synthetic rows only; the epochs below are not confirmed from populated real tables.
+# browser_history holds pages open in a phone browser, as offered to the PC. It has no timestamp column; Rank is the only ordering.
+# continue_app_context holds what the user was doing in a phone app, offered to the PC for cross-device handoff.
+# The epoch of create_time and last_updated_time could not be confirmed with empty tables. The *TimeUTC columns convert by size (.NET ticks, FILETIME, Unix microseconds, milliseconds or seconds; each range maps to plausible dates only), and the *Raw columns keep the original value so the conversion can be checked.
+# life_time defaults to -1 and its unit is unknown, so it is left raw.
+# The format of the Favicon and Preview blobs is unknown, so they are saved with the default .blob extension.
+# Use SQLECmd in conjunction with the Windows Your Phone KAPE Target: https://github.com/EricZimmerman/KapeFiles/blob/master/Targets/Apps/WindowsYourPhone.tkape
+# Blob columns are wrapped in CAST( COALESCE( blob, X'' ) AS BLOB ): SQLECmd builds the CSV header from the first row, so a NULL blob in some rows would shift later fields, including SourceFile. An empty blob writes no file.
+# SQLECmd notes: run it on copies, because it writes -shm/-wal files beside the input. It skips locked or hot-journal databases and ignores a WAL whose header does not match, both without an error exit code. It has no query timeout. It converts a value whose stored type differs from the column's declared type (text in an INTEGER column becomes 0 or its leading number), so the *Raw columns are cast to text to keep the stored value. Open the CSVs as text (or in Timeline Explorer): cells keep values exactly as stored, including leading = + - @ and NUL characters.

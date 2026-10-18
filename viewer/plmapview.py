@@ -1,0 +1,457 @@
+"""
+plmapview.py - Phone Link relations viewer.
+
+Shows the SQLECmd map output for a Phone Link device folder, every table as an
+entity list, and 25 relations between the tables. Select a row to see every row
+it links to; double-click a link to jump to that row in its own table.
+
+Works on COPIES only (staged by plrelate / plparse, hash-verified, read-only).
+Standard library only.
+
+    python plmapview.py --input "<...\\LocalCache\\Indexed\\<GUID>\\System\\Database>"
+    python plmapview.py --input "%LOCALAPPDATA%\\Packages\\Microsoft.YourPhone_8wekyb3d8bbwe"
+    python plmapview.py --demo                  # synthetic data, nothing real
+"""
+import argparse
+import csv
+import os
+import sys
+import tempfile
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:  # pragma: no cover
+    sys.exit("tkinter is not available in this Python")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import plparse as P  # noqa: E402
+import plrelate as R  # noqa: E402
+
+BG, PANEL, INK, MUTED = "#f4f7fa", "#16293f", "#13233a", "#667c93"
+KIND = {  # kind -> (heading, colour, plain meaning)
+    "table": ("Table", "#1e3a56", "Rows of one table"),
+    "in-table": ("Inside one table", "#2e7d32", "Rows of the SAME table that belong together, or data packed inside a row"),
+    "in-db": ("Between tables of one database", "#00897b", "Tables in the SAME database file joined by an ID column"),
+    "check": ("Checks", "#c62828", "Rows whose partner is missing, or counts that disagree"),
+    "cross": ("Across databases", "#e08a00", "Joins between DIFFERENT database files - inferences, hidden by default"),
+    "map": ("SQLECmd map output", "#6a1b9a", "Exactly what the SQLECmd maps return"),
+    "provenance": ("Provenance", "#546e7a", "Where the copies came from and their hashes"),
+}
+SCOPE_WORDS = {"in-table": "same table", "in-db": "other table, same database", "check": "check",
+               "cross": "other database (inferred)"}
+WIDE = {"Title", "Text", "BigText", "BigTitle", "SubText", "TickerText", "Message", "Body", "Row", "Notification",
+        "Deleted", "LiveCopy", "Payload", "Key", "GroupKey", "What", "Flags", "First", "Second", "Value", "Check"}
+# relation-table column -> entity kind, so rows without their own identity can still link
+COL_ENTITY = {"CallID": "call", "ContactID": "contact", "ThreadID": "thread", "MediaID": "photo",
+              "ParticipantID": "participant", "RCSThreadID": "rcsthread", "MMSID": "mms", "Package": "app"}
+# MessageID means an SMS only in these relations (in R06 it is an RCS chat id)
+VIEW_COL_ENTITY = {vid: {"MessageID": "sms"} for vid in ("R03", "R09", "R10", "R15")}
+
+
+def _dpi_aware():
+    """Crisp text on scaled Windows displays, and window coordinates that match the screen."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            pass
+
+
+class Viewer(tk.Tk):
+    def __init__(self, devices, window_min=R.DEFAULT_WINDOW_MIN, initial=None):
+        _dpi_aware()
+        super().__init__()
+        self.devices = devices
+        self.window_min = tk.IntVar(value=window_min)
+        self.ev = self.g = None
+        self.show_cross = tk.BooleanVar(value=False)
+        self.cur_vid = None
+        self.cur_rows = []
+        self.sort_state = {}
+        self.title("Phone Link Relations Viewer")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(1600, int(sw * 0.92)), min(960, int(sh * 0.88))
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 3)}")
+        self.basis_wrap = w - 400
+        self.configure(bg=BG)
+        self._style()
+        self._layout()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.load_device(0, initial)
+
+    # ------------------------------------------------------------ layout
+    def _style(self):
+        st = ttk.Style(self)
+        try:
+            st.theme_use("clam")
+        except tk.TclError:
+            pass
+        st.configure("Treeview", rowheight=22, font=("Segoe UI", 9))
+        st.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        st.configure("Nav.Treeview", rowheight=22, font=("Segoe UI", 9))
+
+    def _layout(self):
+        bar = tk.Frame(self, bg=PANEL, height=52)
+        bar.pack(fill="x")
+        tk.Label(bar, text="Phone Link Relations Viewer", bg=PANEL, fg="white",
+                 font=("Cambria", 15, "bold")).pack(side="left", padx=14, pady=10)
+        self.src_lbl = tk.Label(bar, text="", bg=PANEL, fg="#9fb3c8", font=("Segoe UI", 9))
+        self.src_lbl.pack(side="left", padx=8)
+        tk.Button(bar, text="Export view (CSV)", command=self.export, relief="flat", bg="#2ec4b6", fg="white",
+                  padx=10).pack(side="right", padx=8)
+        tk.Button(bar, text="Open folder...", command=self.open_folder, relief="flat", bg="#1e3a56", fg="white",
+                  padx=10).pack(side="right", padx=4)
+        tk.Checkbutton(bar, text="Show cross-database links", variable=self.show_cross, command=self.fill_nav,
+                       bg=PANEL, fg="#9fb3c8", selectcolor=PANEL, activebackground=PANEL).pack(side="right", padx=12)
+        tk.Label(bar, text="Nearby (min):", bg=PANEL, fg="#9fb3c8").pack(side="right", padx=(12, 2))
+        sp = tk.Spinbox(bar, from_=1, to=1440, width=5, textvariable=self.window_min, command=self.rebuild)
+        sp.bind("<Return>", lambda e: self.rebuild())
+        sp.pack(side="right")
+        self.dev_combo = ttk.Combobox(bar, state="readonly", width=38,
+                                      values=[f"{lbl}" for lbl, _ in self.devices])
+        self.dev_combo.bind("<<ComboboxSelected>>", lambda e: self.load_device(self.dev_combo.current()))
+        if len(self.devices) > 1:
+            tk.Label(bar, text="Device:", bg=PANEL, fg="#9fb3c8").pack(side="right", padx=(12, 2))
+            self.dev_combo.pack(side="right")
+
+        body = tk.PanedWindow(self, orient="horizontal", sashwidth=4, bg=BG)
+        body.pack(fill="both", expand=True)
+        left = tk.Frame(body, bg="white")
+        body.add(left, minsize=260, width=400)
+        tk.Label(left, text="VIEWS", bg="white", fg=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12,
+                                                                                            pady=(10, 2))
+        self.nav = ttk.Treeview(left, show="tree", style="Nav.Treeview", selectmode="browse")
+        self.nav.pack(fill="both", expand=True, padx=6, pady=6)
+        self.nav.bind("<<TreeviewSelect>>", self.on_nav)
+        for k, (_, colour, _) in KIND.items():
+            self.nav.tag_configure(k, foreground=colour)
+        self.nav.tag_configure("db", foreground=INK, font=("Segoe UI", 9, "bold"))
+
+        right = tk.PanedWindow(body, orient="vertical", sashwidth=4, bg=BG)
+        body.add(right)
+        top = tk.Frame(right, bg=BG)
+        right.add(top, minsize=300)
+        head = tk.Frame(top, bg=BG)
+        head.pack(fill="x", padx=12, pady=(10, 0))
+        self.title_lbl = tk.Label(head, text="", bg=BG, fg=INK, font=("Cambria", 14, "bold"), anchor="w")
+        self.title_lbl.pack(side="left")
+        self.kind_lbl = tk.Label(head, text="", fg="white", font=("Segoe UI", 8, "bold"), padx=8)
+        self.kind_lbl.pack(side="left", padx=10)
+        tk.Label(head, text="Filter:", bg=BG, fg=MUTED).pack(side="left", padx=(20, 4))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *a: self.populate())
+        tk.Entry(head, textvariable=self.filter_var, width=30).pack(side="left")
+        self.count_lbl = tk.Label(head, text="", bg=BG, fg=MUTED)
+        self.count_lbl.pack(side="left", padx=10)
+        self.basis_lbl = tk.Label(top, text="", bg=BG, fg=INK, anchor="w", justify="left", wraplength=self.basis_wrap,
+                                  font=("Segoe UI", 9, "italic"))
+        self.basis_lbl.pack(fill="x", padx=12, pady=(4, 6))
+        wrap = tk.Frame(top, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        self.table = ttk.Treeview(wrap, show="headings", selectmode="browse")
+        ys = ttk.Scrollbar(wrap, orient="vertical", command=self.table.yview)
+        xs = ttk.Scrollbar(wrap, orient="horizontal", command=self.table.xview)
+        self.table.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        self.table.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        self.table.bind("<<TreeviewSelect>>", self.on_row)
+
+        bottom = tk.PanedWindow(right, orient="horizontal", sashwidth=4, bg=BG)
+        right.add(bottom, minsize=180)
+        dframe = tk.Frame(bottom, bg=BG)
+        bottom.add(dframe, minsize=300)
+        tk.Label(dframe, text="SELECTED ROW", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12)
+        self.detail = tk.Text(dframe, height=9, wrap="word", bg="white", fg=INK, relief="flat",
+                              font=("Segoe UI", 9), padx=10, pady=6)
+        self.detail.pack(fill="both", expand=True, padx=12, pady=(2, 8))
+        lframe = tk.Frame(bottom, bg=BG)
+        bottom.add(lframe, minsize=420)
+        tk.Label(lframe, text="LINKED ROWS  (double-click to jump)", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6)
+        self.links = ttk.Treeview(lframe, columns=("how", "target", "where", "scope"), show="headings", height=8)
+        for c, w, t in (("how", 460, "How it is linked"), ("target", 340, "Linked row"), ("where", 260, "Its table"),
+                        ("scope", 170, "Where")):
+            self.links.heading(c, text=t)
+            self.links.column(c, width=w, minwidth=80, anchor="w", stretch=False)
+        for k, (_, colour, _) in KIND.items():
+            self.links.tag_configure(k, foreground=colour)
+        self.links.pack(fill="both", expand=True, padx=6, pady=(2, 8))
+        self.links.bind("<Double-1>", self.on_jump)
+        self.link_targets = {}
+
+        self.status = tk.Label(self, text="", bg=PANEL, fg="#9fb3c8", anchor="w", font=("Segoe UI", 8), padx=12)
+        self.status.pack(fill="x", side="bottom")
+
+    # ------------------------------------------------------------ data
+    def load_device(self, i, initial=None):
+        if self.ev:
+            self.ev.close()
+        label, path = self.devices[i]
+        self.dev_combo.current(i)
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            self.ev = R.Evidence(path)
+            self.g = R.build(self.ev, self.window_min.get())
+        except Exception as e:  # report and keep the window usable
+            self.config(cursor="")
+            messagebox.showerror("Could not load", f"{path}\n\n{type(e).__name__}: {e}")
+            return
+        self.config(cursor="")
+        self.src_lbl.config(text=f"{label}  -  {path}")
+        ok = sum(v["copy_matches"] == "yes" for v in self.ev.verify)
+        self.status.config(text=f"Read-only COPIES in {self.ev.work}  |  {ok}/{len(self.ev.verify)} copies match "
+                                f"their source SHA-256  |  the source folder is never opened by SQLite  |  "
+                                f"{len(self.g.relations)} relations, "
+                                f"{sum(len(x) for x in self.g.edges.values()) // 2:,} links")
+        self.fill_nav()
+        self.show(initial or self.cur_vid or "N_notifications")
+
+    def rebuild(self):
+        if not self.ev:
+            return
+        try:
+            self.g = R.build(self.ev, int(self.window_min.get()))
+        except (ValueError, tk.TclError):
+            return
+        self.fill_nav()
+        self.show(self.cur_vid)
+
+    def fill_nav(self):
+        self.nav.delete(*self.nav.get_children())
+        order = {"table": 0, "in-table": 1, "in-db": 2}
+        built = {vid: i for i, vid in enumerate(self.g.views)}  # keep the order the engine built them in
+        shown = [v for v in self.g.views.values() if v.kind != "cross" or self.show_cross.get()]
+        for db in R.P.DB_NAMES:
+            views = sorted((v for v in shown if v.db == db and v.kind in order),
+                           key=lambda v: (order[v.kind], built[v.vid]))
+            if not views:
+                continue
+            node = self.nav.insert("", "end", iid=f"db:{db}", text=db, open=(db == "notifications.db"), tags=("db",))
+            last = None
+            for v in views:
+                if v.kind != last and v.kind != "table":
+                    self.nav.insert(node, "end", iid=f"sec:{db}:{v.kind}", text="   " + KIND[v.kind][0].upper(),
+                                    tags=(v.kind,))
+                last = v.kind
+                self.nav.insert(node, "end", iid=v.vid, text=f"{v.title}  ({len(v.rows):,})", tags=(v.kind,))
+        for kind in ("check", "cross", "map", "provenance"):
+            views = [v for v in shown if v.kind == kind]
+            if views:
+                node = self.nav.insert("", "end", iid=f"sec:{kind}", text=KIND[kind][0], open=False, tags=(kind,))
+                for v in views:
+                    self.nav.insert(node, "end", iid=v.vid, text=f"{v.title}  ({len(v.rows):,})", tags=(v.kind,))
+        if self.cur_vid in self.g.views and self.nav.exists(self.cur_vid):
+            self.nav.selection_set(self.cur_vid)
+            self.nav.see(self.cur_vid)
+
+    # ------------------------------------------------------------ views
+    def on_nav(self, _=None):
+        sel = self.nav.selection()
+        if sel and not sel[0].startswith(("sec:", "db:")) and sel[0] != self.cur_vid:
+            self.show(sel[0], from_nav=True)
+
+    def show(self, vid, from_nav=False, select_index=None):
+        if vid not in self.g.views:
+            vid = next(iter(self.g.views))
+        v = self.g.views[vid]
+        self.cur_vid = vid
+        if not from_nav and self.nav.exists(vid):
+            self.nav.selection_set(vid)
+            self.nav.see(vid)
+        name, colour, meaning = KIND[v.kind]
+        self.title_lbl.config(text=v.title)
+        self.kind_lbl.config(text=v.kind.upper(), bg=colour)
+        where = f"{v.db}  -  " if v.db else ""
+        self.basis_lbl.config(text=f"{where}{meaning}.   Source: {v.basis}.", fg=colour)
+        self.table["columns"] = v.cols
+        for c in v.cols:
+            self.table.heading(c, text=c, command=lambda c=c: self.sort_by(c))
+            self.table.column(c, width=260 if c in WIDE else max(80, min(220, 9 * len(c) + 40)), anchor="w",
+                              stretch=False)
+        if select_index is not None:
+            self.filter_var.set("")
+        self.populate(select_index)
+
+    def populate(self, select_index=None):
+        if not self.g or self.cur_vid not in self.g.views:
+            return
+        v = self.g.views[self.cur_vid]
+        f = self.filter_var.get().strip().lower()
+        self.table.delete(*self.table.get_children())
+        self.cur_rows = []
+        for i, r in enumerate(v.rows):
+            vals = ["" if r.get(c) is None else str(r.get(c)) for c in v.cols]
+            if f and not any(f in x.lower() for x in vals):
+                continue
+            self.cur_rows.append(i)
+            self.table.insert("", "end", iid=str(i), values=vals)
+        self.count_lbl.config(text=f"{len(self.cur_rows):,} of {len(v.rows):,} rows")
+        self.detail.delete("1.0", "end")
+        self.links.delete(*self.links.get_children())
+        if select_index is not None and str(select_index) in self.table.get_children():
+            self.table.selection_set(str(select_index))
+            self.table.see(str(select_index))
+            self.table.focus(str(select_index))
+
+    def sort_by(self, col):
+        rev = self.sort_state.get(col, False)
+        items = [(self.table.set(k, col), k) for k in self.table.get_children("")]
+
+        def key(x):
+            try:
+                return (0, float(x[0]))
+            except ValueError:
+                return (1, x[0].lower())
+        items.sort(key=key, reverse=rev)
+        for n, (_, k) in enumerate(items):
+            self.table.move(k, "", n)
+        self.sort_state[col] = not rev
+
+    # ------------------------------------------------------------ links
+    def row_entities(self, row):
+        ents = []
+        if row.get("_e"):
+            ents.append(row["_e"])
+        here = self.g.views[self.cur_vid].db
+        for col, kind in list(COL_ENTITY.items()) + list(VIEW_COL_ENTITY.get(self.cur_vid, {}).items()):
+            if row.get(col) not in (None, ""):
+                e = (kind, row[col])
+                if e in self.g.home and e not in ents:
+                    same_db = self.g.views[self.g.home[e][0]].db == here
+                    if same_db or self.show_cross.get():
+                        ents.append(e)
+        return ents
+
+    def on_row(self, _=None):
+        sel = self.table.selection()
+        if not sel:
+            return
+        v = self.g.views[self.cur_vid]
+        row = v.rows[int(sel[0])]
+        self.detail.delete("1.0", "end")
+        self.detail.tag_configure("k", font=("Segoe UI", 9, "bold"), foreground=MUTED)
+        for c in v.cols:
+            val = row.get(c)
+            if val in (None, ""):
+                continue
+            self.detail.insert("end", f"{c}: ", "k")
+            self.detail.insert("end", f"{val}\n")
+        if row.get("_json"):
+            import json
+            self.detail.insert("end", "\nRaw JSON (as stored):\n", "k")
+            self.detail.insert("end", json.dumps(row["_json"], indent=2, ensure_ascii=False))
+        self.links.delete(*self.links.get_children())
+        self.link_targets = {}
+        n = 0
+        own = row.get("_e")
+        for ent in self.row_entities(row):
+            for rid, target, note in sorted(self.g.links(ent), key=lambda x: (x[0], str(x[1]))):
+                rv = self.g.views.get(rid)
+                scope = rv.kind if rv else "in-table"
+                if scope == "cross" and not self.show_cross.get():
+                    continue
+                if target == own:
+                    continue
+                home = self.g.home.get(target)
+                where = ""
+                if home:
+                    hv = self.g.views[home[0]]
+                    where = f"{hv.db or ''} / {hv.title}"
+                iid = f"l{n}"
+                self.links.insert("", "end", iid=iid, tags=(scope,),
+                                  values=(note or (rv.title if rv else rid), self.g.label.get(target, str(target)),
+                                          where, SCOPE_WORDS.get(scope, scope)))
+                self.link_targets[iid] = target
+                n += 1
+        if n == 0:
+            self.links.insert("", "end", values=("No other row is linked to this one" +
+                                                 ("" if self.show_cross.get() else " inside its database"), "", "", ""))
+
+    def on_jump(self, _=None):
+        sel = self.links.selection()
+        if not sel or sel[0] not in self.link_targets:
+            return
+        target = self.link_targets[sel[0]]
+        if target not in self.g.home:
+            messagebox.showinfo("No table row", f"{target} has no row of its own to open.")
+            return
+        vid, idx = self.g.home[target]
+        self.show(vid, select_index=idx)
+        self.on_row()
+
+    # ------------------------------------------------------------ actions
+    def open_folder(self):
+        d = filedialog.askdirectory(title="Phone Link device Database folder, or the package folder")
+        if not d:
+            return
+        devs = P.find_device_dirs(d)
+        if not devs:
+            messagebox.showerror("No Phone Link databases", f"No Phone Link databases found under\n{d}")
+            return
+        self.devices = devs
+        self.dev_combo["values"] = [lbl for lbl, _ in devs]
+        self.cur_vid = None
+        self.load_device(0)
+
+    def export(self):
+        if not self.cur_vid:
+            return
+        v = self.g.views[self.cur_vid]
+        path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"{self.cur_vid}.csv",
+                                            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(v.cols)
+            for i in self.cur_rows:
+                w.writerow([v.rows[i].get(c) for c in v.cols])
+        self.status.config(text=f"Exported {len(self.cur_rows):,} rows to {path} (contains case data - keep local)")
+
+    def on_close(self):
+        if self.ev:
+            self.ev.close()
+        self.destroy()
+
+    def screenshot(self, path):
+        """Save the window to a PNG (needs Pillow). Used for verification."""
+        from PIL import ImageGrab
+        self.update()
+        x, y = self.winfo_rootx(), self.winfo_rooty()
+        ImageGrab.grab(bbox=(x, y, x + self.winfo_width(), y + self.winfo_height())).save(path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--input", help="device Database folder, Indexed folder or Phone Link package folder")
+    src.add_argument("--demo", action="store_true", help="synthetic data only")
+    ap.add_argument("--window", type=int, default=R.DEFAULT_WINDOW_MIN, help="nearby-events window in minutes")
+    ap.add_argument("--view", help="view to open first, for example R13 or E_calls")
+    ap.add_argument("--select", type=int, help="row index to select in that view")
+    ap.add_argument("--screenshot", help="save a PNG of the window and exit (needs Pillow)")
+    a = ap.parse_args()
+    if a.demo:
+        import pldemo
+        devices = [("demo (synthetic)", pldemo.build(os.path.join(tempfile.mkdtemp(prefix="pldemo-"), "device")))]
+    else:
+        devices = P.find_device_dirs(os.path.expandvars(a.input))
+        if not devices:
+            sys.exit(f"No Phone Link databases found under {a.input}")
+    app = Viewer(devices, a.window, a.view)
+    if a.select is not None:
+        app.show(app.cur_vid, select_index=a.select)
+        app.on_row()
+    if a.screenshot:
+        app.after(1500, lambda: (app.screenshot(a.screenshot), app.on_close()))
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

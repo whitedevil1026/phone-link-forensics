@@ -1,0 +1,112 @@
+Description: Windows Your Phone (Phone Link) Phone Apps - Android apps installed on the linked phone
+Author: whitedevil1026
+Email: 145743158+whitedevil1026@users.noreply.github.com
+Id: 044df0bf-6654-4a4f-b872-4a2e7c64b961
+Version: 1.1
+CSVPrefix: WindowsYourPhone
+FileName: phoneapps.db
+IdentifyQuery: SELECT ((SELECT count(*) FROM pragma_table_info('phone_apps') WHERE name IN ('app_id','app_name','package_name','version','favorite_rank','blob','last_updated_time','phoneapp_web_url')) + (SELECT count(*) FROM pragma_table_info('recent_apps') WHERE name IN ('app_id','package_name','app_name','recent_app_rank','intent_action','task_id','blob','web_uri','desktop_uri')) + (SELECT count(*) FROM pragma_table_info('pcapp_data') WHERE name IN ('id','package_name','is_installed','platformapp_url','platformapp_id','last_fetched','platformapp_package'))) + (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('pcapp_data', 'phone_apps', 'recent_apps'));
+IdentifyValue: 27
+Queries:
+    -
+        Name: Windows Your Phone Phone Apps Database Installed Apps
+        Query: |
+                SELECT
+                phone_apps.app_id AS AppID,
+                phone_apps.app_name AS AppName,
+                phone_apps.package_name AS PackageName,
+                phone_apps.version AS Version,
+                CASE
+
+                WHEN typeof( phone_apps.last_updated_time ) IN ( 'integer', 'real' ) AND phone_apps.last_updated_time > 0 THEN
+                datetime( phone_apps.last_updated_time / 1000, 'unixepoch' )
+                END AS LastUpdatedTimeUTC,
+                phone_apps.favorite_rank AS FavoriteRank,
+                phone_apps.phoneapp_web_url AS WebURL,
+                printf( '%d_%s', phone_apps.app_id, phone_apps.package_name ) AS IconFileName,
+                CAST( COALESCE( phone_apps.blob, X'' ) AS BLOB ) AS Icon
+                FROM
+                phone_apps
+                ORDER BY
+                phone_apps.app_name ASC
+        BaseFileName: PhoneAppsDB_InstalledApps
+        BlobColumns:
+            - BlobColumn: Icon
+              NameColumn: IconFileName
+              BlobExtension: png
+    -
+        Name: Windows Your Phone Phone Apps Database Recent Apps
+        Query: |
+                SELECT
+                recent_apps.app_id AS AppID,
+                recent_apps.recent_app_rank AS Rank,
+                recent_apps.app_name AS AppName,
+                recent_apps.package_name AS PackageName,
+                recent_apps.intent_action AS IntentAction,
+                recent_apps.web_uri AS WebURI,
+                recent_apps.desktop_uri AS DesktopURI,
+                recent_apps.task_id AS AndroidTaskID,
+                printf( '%d_%s', recent_apps.app_id, recent_apps.package_name ) AS IconFileName,
+                CAST( COALESCE( recent_apps.blob, X'' ) AS BLOB ) AS Icon
+                FROM
+                recent_apps
+                ORDER BY
+                recent_apps.recent_app_rank ASC
+        BaseFileName: PhoneAppsDB_RecentApps
+        BlobColumns:
+            - BlobColumn: Icon
+              NameColumn: IconFileName
+    -
+        Name: Windows Your Phone Phone Apps Database PC App Data
+        Query: |
+                SELECT
+                pcapp_data.id AS ID,
+                pcapp_data.package_name AS PackageName,
+                apps.AppNames AS AppName,
+                CASE
+
+                WHEN pcapp_data.is_installed = 0 THEN
+                'No'
+                WHEN pcapp_data.is_installed = 1 THEN
+                'Yes' ELSE pcapp_data.is_installed
+                END AS IsInstalled,
+                pcapp_data.platformapp_id AS PlatformAppID,
+                pcapp_data.platformapp_package AS PlatformAppPackage,
+                pcapp_data.platformapp_url AS PlatformAppURL,
+                CASE
+
+                WHEN typeof( pcapp_data.last_fetched ) NOT IN ( 'integer', 'real' ) THEN
+                NULL
+                WHEN pcapp_data.last_fetched >= 400000000000000000 THEN
+                datetime( ( pcapp_data.last_fetched - 621355968000000000 ) / 10000000, 'unixepoch' )
+                WHEN pcapp_data.last_fetched >= 10000000000000000 THEN
+                datetime( ( pcapp_data.last_fetched / 10000000 ) - 11644473600, 'unixepoch' )
+                WHEN pcapp_data.last_fetched >= 100000000000000 THEN
+                datetime( pcapp_data.last_fetched / 1000000, 'unixepoch' )
+                WHEN pcapp_data.last_fetched >= 100000000000 THEN
+                datetime( pcapp_data.last_fetched / 1000, 'unixepoch' )
+                WHEN typeof( pcapp_data.last_fetched ) IN ( 'integer', 'real' ) AND pcapp_data.last_fetched > 0 THEN
+                datetime( pcapp_data.last_fetched, 'unixepoch' )
+                END AS LastFetchedUTC,
+                CAST( pcapp_data.last_fetched AS TEXT ) AS LastFetchedRaw
+                FROM
+                pcapp_data
+                LEFT JOIN (SELECT package_name, group_concat( app_name, ', ' ) AS AppNames FROM (SELECT DISTINCT package_name, app_name FROM phone_apps ORDER BY package_name, app_name) GROUP BY package_name) AS apps ON apps.package_name = pcapp_data.package_name
+                ORDER BY
+                pcapp_data.package_name ASC
+        BaseFileName: PhoneAppsDB_PCAppData
+
+# Documentation
+# phoneapps.db sits in %LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe\LocalCache\Indexed\<device GUID>\System\Database\
+# Tested on a current Windows 11 build (October 2026).
+# The IdentifyQuery needs pcapp_data and phone_apps.phoneapp_web_url. On current builds settings.db still contains old, empty phone_apps and recent_apps tables (those are read by Windows_YourPhone_SettingsDB.smap), and this check keeps settings.db from matching this map.
+# phone_apps.last_updated_time is Unix milliseconds, not FILETIME like the other Phone Link databases. It is UTC and comes from the PC's sync.
+# FavoriteRank is -1 for apps the user has not pinned. The meaning of other values is not confirmed, so the value is left raw.
+# Icon blobs in phone_apps are PNG. The format of recent_apps icons is not confirmed, so they keep the default .blob extension.
+# IconFileName (app_id + package name) names each icon file. package_name alone is not unique: cloned apps share it, and SQLECmd cuts names to 50 characters and overwrites a file with the same name, so icons would be lost.
+# Rows can exist only in phoneapps.db-wal. Collect the -wal and -shm files with each database.
+# pcapp_data links an Android package to its Windows counterpart. The epoch of last_fetched could not be confirmed, so LastFetchedUTC converts by size (.NET ticks, FILETIME, Unix microseconds, milliseconds or seconds) and LastFetchedRaw keeps the original value.
+# AppName lists every phone_apps name for the package (cloned apps can share one), so each pcapp_data row appears once. SQLite does not guarantee the order of the names. The names are grouped once and joined, which stays fast on large tables.
+# Use SQLECmd in conjunction with the Windows Your Phone KAPE Target: https://github.com/EricZimmerman/KapeFiles/blob/master/Targets/Apps/WindowsYourPhone.tkape
+# Blob columns are wrapped in CAST( COALESCE( blob, X'' ) AS BLOB ): SQLECmd builds the CSV header from the first row, so a NULL blob in some rows would shift later fields, including SourceFile. An empty blob writes no file.
+# SQLECmd notes: run it on copies, because it writes -shm/-wal files beside the input. It skips locked or hot-journal databases and ignores a WAL whose header does not match, both without an error exit code. It has no query timeout. It converts a value whose stored type differs from the column's declared type (text in an INTEGER column becomes 0 or its leading number), so the *Raw columns are cast to text to keep the stored value. Open the CSVs as text (or in Timeline Explorer): cells keep values exactly as stored, including leading = + - @ and NUL characters.

@@ -1,0 +1,79 @@
+Description: Windows Your Phone (Phone Link) Call History
+Author: whitedevil1026
+Email: 145743158+whitedevil1026@users.noreply.github.com
+Id: ec5cd8ac-0385-4479-a07e-149315f99c7e
+Version: 1.1
+CSVPrefix: WindowsYourPhone
+FileName: calling.db
+IdentifyQuery: SELECT (SELECT count(*) FROM pragma_table_info('call_history') WHERE name IN ('call_id','phone_number','duration','call_type','start_time','is_read','phone_account_id','last_updated_time')) + (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('call_history'));
+IdentifyValue: 9
+Queries:
+    -
+        Name: Windows Your Phone Calling Database Call History
+        Query: |
+                SELECT
+                call_history.call_id AS CallID,
+                CASE
+                WHEN typeof( call_history.start_time ) IN ( 'integer', 'real' ) AND call_history.start_time > 0 THEN
+                datetime( ( call_history.start_time / 10000000 ) - 11644473600, 'unixepoch' )
+                END AS StartTimeUTC,
+                call_history.phone_number AS PhoneNumber,
+                CASE
+
+                WHEN call_history.call_type = 1 THEN
+                'Incoming'
+                WHEN call_history.call_type = 2 THEN
+                'Outgoing'
+                WHEN call_history.call_type = 3 THEN
+                'Missed'
+                WHEN call_history.call_type = 4 THEN
+                'Voicemail'
+                WHEN call_history.call_type = 5 THEN
+                'Rejected'
+                WHEN call_history.call_type = 6 THEN
+                'Blocked'
+                WHEN call_history.call_type = 7 THEN
+                'AnsweredExternally' ELSE call_history.call_type
+                END AS CallType,
+                CASE
+                WHEN typeof( call_history.duration ) IN ( 'integer', 'real' ) THEN
+                call_history.duration ELSE CAST( call_history.duration AS TEXT )
+                END AS DurationSeconds,
+                CASE
+
+                WHEN typeof( call_history.duration ) = 'integer' AND call_history.duration >= 0 THEN
+                printf( '%02d:%02d:%02d', call_history.duration / 3600, ( call_history.duration % 3600 ) / 60, call_history.duration % 60 )
+                END AS Duration,
+                CASE
+
+                WHEN call_history.is_read = 0 THEN
+                'No'
+                WHEN call_history.is_read = 1 THEN
+                'Yes' ELSE call_history.is_read
+                END AS IsRead,
+                call_history.phone_account_id AS PhoneAccountID,
+                CASE
+
+                WHEN typeof( call_history.last_updated_time ) IN ( 'integer', 'real' ) AND call_history.last_updated_time > 0 THEN
+                datetime( ( call_history.last_updated_time / 10000000 ) - 11644473600, 'unixepoch' )
+                END AS LastUpdatedTimeUTC,
+                CAST( call_history.start_time AS TEXT ) AS StartTimeRaw,
+                CAST( call_history.last_updated_time AS TEXT ) AS LastUpdatedTimeRaw
+                FROM
+                call_history
+                ORDER BY
+                call_history.start_time ASC
+        BaseFileName: CallingDB_CallHistory
+
+# Documentation
+# calling.db sits in %LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe\LocalCache\Indexed\<device GUID>\System\Database\
+# Tested on a current Windows 11 build (October 2026).
+# start_time and last_updated_time are FILETIME, in UTC. A value of 0 or less, or a value that is not a number, gives an empty time; the *Raw columns keep the stored value. start_time comes from the phone's clock and last_updated_time from the PC's sync.
+# duration is in seconds. Duration shows it as hours:minutes:seconds and does not wrap after 24 hours.
+# call_type follows Android CallLog.Calls.TYPE: https://developer.android.com/reference/android/provider/CallLog.Calls#TYPE
+# OEMs can add other values; those are shown as the raw number.
+# phone_account_id identifies the SIM or calling account. phone_number is plain text; nothing links it to contacts.db, so any name lookup is the examiner's own join.
+# Phone Link keeps about 90 days of calls on the PC (Microsoft support documentation), so older calls are only on the phone.
+# https://github.com/kacos2000/Win10/blob/master/YourPhone/yourphone_calls.sql
+# Use SQLECmd in conjunction with the Windows Your Phone KAPE Target: https://github.com/EricZimmerman/KapeFiles/blob/master/Targets/Apps/WindowsYourPhone.tkape
+# SQLECmd notes: run it on copies, because it writes -shm/-wal files beside the input. It skips locked or hot-journal databases and ignores a WAL whose header does not match, both without an error exit code. It has no query timeout. It converts a value whose stored type differs from the column's declared type (text in an INTEGER column becomes 0 or its leading number), so the *Raw columns are cast to text to keep the stored value. Open the CSVs as text (or in Timeline Explorer): cells keep values exactly as stored, including leading = + - @ and NUL characters.

@@ -1,0 +1,37 @@
+Description: Windows Your Phone (Phone Link) Device Data - linked phone's wallpaper image
+Author: whitedevil1026
+Email: 145743158+whitedevil1026@users.noreply.github.com
+Id: 1df6b67b-3e25-446f-b327-916d32fd04a6
+Version: 1.0
+CSVPrefix: WindowsYourPhone
+FileName: deviceData.db
+IdentifyQuery: SELECT ((SELECT count(*) FROM pragma_table_info('wallpaper') WHERE name IN ('wallpaper_type','wallpaper_id','blob')) + (SELECT count(*) FROM sqlite_master WHERE type='table' AND name='content_sequence')) + (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('wallpaper'));
+IdentifyValue: 5
+Queries:
+    -
+        Name: Windows Your Phone Device Data Database Wallpaper
+        Query: |
+                SELECT
+                wallpaper.wallpaper_type AS WallpaperType,
+                wallpaper.wallpaper_id AS WallpaperID,
+                length( wallpaper.blob ) AS SizeBytes,
+                CAST( COALESCE( wallpaper.blob, X'' ) AS BLOB ) AS Wallpaper
+                FROM
+                wallpaper
+                ORDER BY
+                wallpaper.wallpaper_type ASC
+        BaseFileName: DeviceDataDB_Wallpaper
+        BlobColumns:
+            - BlobColumn: Wallpaper
+              NameColumn: WallpaperType
+              BlobExtension: jpg
+
+# Documentation
+# deviceData.db sits in %LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe\LocalCache\Indexed\<device GUID>\System\Database\
+# Tested on a current Windows 11 build (October 2026).
+# The wallpaper blob is the phone's wallpaper image, a JPEG. The .jpg extension is a file name only, so check the header if a later build changes the format.
+# The meaning of wallpaper_type values is not confirmed. It is the table's primary key, so it is unique and safe as the blob file name.
+# The IdentifyQuery also checks for the Phone Link content_sequence table, because a table named wallpaper with a blob column is too generic on its own.
+# Use SQLECmd in conjunction with the Windows Your Phone KAPE Target: https://github.com/EricZimmerman/KapeFiles/blob/master/Targets/Apps/WindowsYourPhone.tkape
+# Blob columns are wrapped in CAST( COALESCE( blob, X'' ) AS BLOB ): SQLECmd builds the CSV header from the first row, so a NULL blob in some rows would shift later fields, including SourceFile. An empty blob writes no file.
+# SQLECmd notes: run it on copies, because it writes -shm/-wal files beside the input. It skips locked or hot-journal databases and ignores a WAL whose header does not match, both without an error exit code. It has no query timeout. It converts a value whose stored type differs from the column's declared type (text in an INTEGER column becomes 0 or its leading number), so the *Raw columns are cast to text to keep the stored value. Open the CSVs as text (or in Timeline Explorer): cells keep values exactly as stored, including leading = + - @ and NUL characters.

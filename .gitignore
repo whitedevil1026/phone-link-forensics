@@ -1,0 +1,18 @@
+# Never commit evidence, tool output or binaries
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.csv
+*.json
+*.log
+*.dll
+*.exe
+*.png
+*.jpg
+*.blob
+out/
+blobs/
+__pycache__/
+*.pyc

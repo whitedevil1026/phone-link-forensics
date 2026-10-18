@@ -1,0 +1,89 @@
+Description: Windows Your Phone Photos DB
+Author: Andrew Rathbun, whitedevil1026
+Email: andrew.d.rathbun@gmail.com
+Id: 560f493c-bdf8-4e23-ac17-3f757c5a048a
+Version: 1.2
+CSVPrefix: WindowsYourPhone
+FileName: photos.db
+IdentifyQuery: SELECT (SELECT count(*) FROM pragma_table_info('media') WHERE name IN ('id','name','mime_type','last_updated_time','taken_time','last_seen_time','height','width','orientation','size','uri')) + (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('media'));
+IdentifyValue: 12
+Queries:
+    -
+        Name: Windows Your Phone Photos Database
+        Query: |
+                SELECT
+                media.id AS 'Media ID',
+                media.mime_type AS 'MIME Type',
+                media.name AS Name,
+                CASE
+                WHEN typeof( media.last_updated_time ) IN ( 'integer', 'real' ) AND media.last_updated_time > 0 THEN
+                datetime( ( media.last_updated_time / 10000000 ) - 11644473600, 'unixepoch' )
+                END AS 'Last Updated Time',
+                CASE
+                WHEN typeof( media.taken_time ) IN ( 'integer', 'real' ) AND media.taken_time > 0 THEN
+                datetime( ( media.taken_time / 10000000 ) - 11644473600, 'unixepoch' )
+                END AS 'Taken Time',
+                CASE
+                WHEN typeof( media.last_seen_time ) IN ( 'integer', 'real' ) AND media.last_seen_time > 0 THEN
+                datetime( ( media.last_seen_time / 10000000 ) - 11644473600, 'unixepoch' )
+                END AS 'Last Seen Time',
+                media.height AS Height,
+                media.width AS Width,
+                media.orientation AS Orientation,
+                ( media.size / 1000.00 ) AS 'Size (kb)',
+                media.uri AS URI,
+                CAST( media.last_updated_time AS TEXT ) AS 'Last Updated Time Raw',
+                CAST( media.taken_time AS TEXT ) AS 'Taken Time Raw',
+                CAST( media.last_seen_time AS TEXT ) AS 'Last Seen Time Raw'
+                FROM
+                media
+                ORDER BY
+                media.id ASC
+        BaseFileName: PhotosDB
+    -
+        Name: Windows Your Phone Photos Database Thumbnails
+        Query: |
+                SELECT
+                media.id AS MediaID,
+                media.name AS Name,
+                length( media.thumbnail ) AS ThumbnailBytes,
+                CAST( media.thumbnail AS BLOB ) AS Thumbnail
+                FROM
+                media
+                WHERE
+                length( media.thumbnail ) > 0
+                ORDER BY
+                media.id ASC
+        BaseFileName: PhotosDB_Thumbnails
+        BlobColumns:
+            - BlobColumn: Thumbnail
+              NameColumn: MediaID
+              BlobExtension: jpg
+    -
+        Name: Windows Your Phone Photos Database Media Blobs
+        Query: |
+                SELECT
+                media.id AS MediaID,
+                media.name AS Name,
+                length( media.media ) AS MediaBytes,
+                CAST( media.media AS BLOB ) AS Media
+                FROM
+                media
+                WHERE
+                length( media.media ) > 0
+                ORDER BY
+                media.id ASC
+        BaseFileName: PhotosDB_MediaBlobs
+        BlobColumns:
+            - BlobColumn: Media
+              NameColumn: MediaID
+
+# Documentation
+# https://github.com/kacos2000/Win10/blob/master/YourPhone/readme.md
+# Use SQLECmd in conjunction with the Windows Your Phone KAPE Target: https://github.com/EricZimmerman/KapeFiles/blob/master/Targets/Apps/WindowsYourPhone.tkape
+# Version 1.2: the IdentifyQuery now checks for the 11 media columns the query reads, instead of requiring both the media and photo tables.
+# Current Phone Link builds (tested October 2026) no longer have a photo table, so version 1.1 returned 1, not 2, and photos.db was skipped.
+# Builds that still have the photo table also match, as long as media has these columns, which version 1.1's query already required.
+# Timestamps are FILETIME, in UTC. taken_time comes from the phone's clock and last_updated_time from the PC's sync. A value of 0 or less, or a value that is not a number, gives an empty time; the Raw columns keep the stored value.
+# Thumbnails (JPEG) and any media blob are exported by their own queries, one file per MediaID, and only for rows that hold one. Keeping each blob in its own query that skips empty rows keeps SQLECmd's CSV columns aligned.
+# SQLECmd notes: run it on copies, because it writes -shm/-wal files beside the input. It skips locked or hot-journal databases and ignores a WAL whose header does not match, both without an error exit code. It has no query timeout. It converts a value whose stored type differs from the column's declared type (text in an INTEGER column becomes 0 or its leading number), so the *Raw columns are cast to text to keep the stored value. Open the CSVs as text (or in Timeline Explorer): cells keep values exactly as stored, including leading = + - @ and NUL characters.
