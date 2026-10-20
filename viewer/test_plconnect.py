@@ -105,15 +105,36 @@ class Build(unittest.TestCase):
         dev = ("usb", "USB\\VID_1234&PID_0F01\\EXAMPLEPHONE01")
         rids = {rid for rid, _, _ in self.g.links(dev)}
         self.assertTrue({"CR1", "CR3", "CR4"} <= rids)
-        ev = self.rows("C_events")
+        ev = [r for r in self.rows("C_events") if r["Log"] == "Kernel-PnP"]
         self.assertEqual(len(ev), 1)           # the non-device PCI event is dropped
         self.assertEqual(ev[0]["MatchedDevice"], self.g.label[dev])
 
     def test_phone_summary(self):
-        got = sorted((r["How"], r["Evidence"]) for r in self.rows("C_phones"))
+        got = sorted((r["How"], r["Evidence"].split(" (")[0]) for r in self.rows("C_phones"))
         self.assertEqual(got, [("Bluetooth", "Bluetooth class of device = Phone"),
                                ("USB cable", "MTP phone/camera driver"),
+                               ("USB cable (MTP event 1005)", "MTP driver customized for this phone"),
                                ("USB cable (MTP)", "same ContainerID as a USB phone")])
+
+    def test_event_meanings_from_windows_text(self):
+        ev = {(r["Log"], r["EventID"]): r for r in self.rows("C_events")}
+        self.assertEqual(ev[("Kernel-PnP", "410")]["Meaning"], "device was started")
+        self.assertEqual(ev[("WPD-MTPClassDriver", "1001")]["Meaning"], "device will suspend when idle")
+        self.assertTrue(all(r["Meaning"] for r in self.rows("C_events")))
+
+    def test_event_1005_names_the_phone(self):
+        p = [r for r in self.rows("C_phones") if "1005" in r["How"]]
+        self.assertEqual(len(p), 1)            # two events, one phone
+        self.assertEqual(p[0]["Device"], "ExampleCorp, Example Phone 2, 9.9")
+        self.assertEqual((p[0]["FirstSeenUTC"], p[0]["LastConnectedUTC"]), ("2030-01-03 10:00:00", "2030-01-04 10:00:00"))
+        links = [t for rid, t, _ in self.g.links(p[0]["_e"]) if rid == "CR4"]
+        self.assertEqual(len(links), 2)
+
+    def test_bluetooth_le(self):
+        le = self.rows("C_btle")
+        self.assertEqual([(r["Kind"], r["Name"], r["Address"]) for r in le],
+                         [("LE device", "Example Watch", "00:00:5E:00:53:03")])
+        self.assertIn(le[0]["_e"], [t for rid, t, _ in self.g.links(("bt", "00005e005303")) if rid == "CR2"])
 
     def test_cached_source_reads_once(self):
         src = Recording(C.demo_source())

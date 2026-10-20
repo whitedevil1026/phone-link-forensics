@@ -1,24 +1,277 @@
-# Phone Link forensics: SQLECmd maps and a relations viewer
+# Phone Link forensics
 
-One tool for the Microsoft Phone Link (formerly Your Phone) databases on Windows 11, in two parts:
+[![tests](https://github.com/whitedevil1026/phone-link-forensics/actions/workflows/tests.yml/badge.svg)](https://github.com/whitedevil1026/phone-link-forensics/actions/workflows/tests.yml)
 
-- **`maps/`**: five [SQLECmd](https://github.com/EricZimmerman/SQLECmd) maps (one fix, four new) for running inside KAPE / SQLECmd.
-- **`viewer/`**: a desktop viewer that shows every table, recovers deleted rows, and links rows to each other, inside each table and between the tables of one database. It also shows the SQLECmd map output. See [Relations viewer](#relations-viewer).
+Forensic tooling for **Microsoft Phone Link** (formerly *Your Phone*), the Windows app that mirrors an Android phone's messages, calls, photos, notifications and apps onto a PC. It also covers the other ways a phone leaves traces on a PC: **USB cable** and **Bluetooth**.
 
-## The maps
+The repository has two parts:
 
-Five SQLECmd maps for Microsoft Phone Link (formerly Your Phone) on Windows 11. The stock map set no longer parses some of these databases and has no map at all for others. Every map is tested against synthetic databases with a known answer key, on both an emulator of SQLECmd's matching rules and the real SQLECmd.
+| Part | What it is | For |
+|---|---|---|
+| [`maps/`](maps) | Five **SQLECmd maps** (one fix, four new) | Running inside Eric Zimmerman's [SQLECmd](https://github.com/EricZimmerman/SQLECmd) / KAPE to turn the Phone Link databases into CSV |
+| [`viewer/`](viewer) | A **desktop viewer** (Python, standard library only) | Exploring the databases, recovering deleted rows, and following how rows relate to each other |
 
-## Why these maps exist
+All screenshots and test data in this repository are **synthetic** (example names, `555-01xx` numbers, documentation-range addresses). No real phone's data is included.
+
+---
+
+## Contents
+
+- [Screenshots](#screenshots)
+- [Quick start](#quick-start)
+- [The viewer](#the-viewer)
+  - [How evidence is handled](#how-evidence-is-handled)
+  - [The window](#the-window)
+  - [Linked phones (this PC)](#linked-phones-this-pc)
+  - [Phone connections: USB cable and Bluetooth (this PC)](#phone-connections-usb-cable-and-bluetooth-this-pc)
+  - [Where Windows stores phone connection traces](#where-windows-stores-phone-connection-traces)
+  - [The Phone Link databases](#the-phone-link-databases)
+  - [notifications.db in detail](#notificationsdb-in-detail)
+- [The SQLECmd maps](#the-sqlecmd-maps)
+- [Tests](#tests)
+- [Limitations](#limitations)
+
+---
+
+## Screenshots
+
+**Linked phones**: every phone ever linked to this PC through Phone Link, including pairings whose data was removed. The panel on the right shows how a pairing connects to its phone details and streamed apps.
+
+![Linked phones](docs/images/01-linked-phones.png)
+
+**Notifications, live and deleted**: rows recovered from free pages are marked `deleted`. The packed JSON is unpacked into columns, and every linked row (group, conversation, older versions, chat messages, buttons, Windows toast, phone request) is listed on the right.
+
+![Notifications](docs/images/02-notifications.png)
+
+**A relation inside one table**: the same Android notification in several versions. Here a deleted row is the earlier version of a live one.
+
+![Notification versions](docs/images/03-notification-versions.png)
+
+**Phones connected by cable or Bluetooth**: one summary of every phone trace on this PC, with the evidence for each.
+
+![Phone connections](docs/images/04-phone-connections.png)
+
+**Bluetooth devices**: name, class of device, LastSeen and LastConnected, linked to the services the device offered.
+
+![Bluetooth devices](docs/images/05-bluetooth.png)
+
+**Connection events**: event-log entries with Windows' own meaning for each event ID. MTP event 1005 names the connected phone's make, model and OS version.
+
+![Connection events](docs/images/08-connection-events.png)
+
+**Relations between tables of one database**: SMS thread -> participants in `phone.db`.
+
+![phone.db relations](docs/images/07-phone-db-relations.png)
+
+**SQLECmd map output**: exactly what the SQLECmd maps return for the same database.
+
+![SQLECmd map output](docs/images/06-sqlecmd-map-output.png)
+
+---
+
+## Quick start
+
+Requirements: **Python 3.8+** on Windows (Tkinter ships with Python). Nothing to install for the viewer.
+
+```bash
+# 1. Try it on synthetic data - nothing real is read
+python viewer/plmapview.py --demo
+
+# 2. One device folder (for example a collected evidence folder)
+python viewer/plmapview.py --input "<...>\LocalCache\Indexed\<device GUID>\System\Database"
+
+# 3. Everything on this PC: all Phone Link pairings, plus phones connected by USB cable or Bluetooth
+python viewer/plmapview.py --input "%LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe"
+
+# 4. Add the cable / Bluetooth section explicitly for any input
+python viewer/plmapview.py --input "<folder>" --this-pc
+```
+
+Phone Link's default location on a PC:
+
+```
+%LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe\LocalCache\Indexed\<device GUID>\System\Database\
+```
+
+That folder holds `phone.db` (SMS, MMS, RCS), `calling.db` (calls), `contacts.db`, `photos.db` (photo index), `phoneapps.db` (installed apps), `notifications.db`, `continuity.db`, `deviceData.db` (wallpaper) and `settings.db`, each with its `-wal` and `-shm`.
+
+---
+
+## The viewer
+
+### How evidence is handled
+
+- **Copies only.** The input folder is copied to a temporary folder first: every `.db` with its `-wal` and `-shm`, plus the package files for *Linked phones*.
+- **Every copy is re-hashed (SHA-256) against its source.** A mismatch stops the load, and the bad copy is removed.
+- **Read-only.** Copies are opened with SQLite `mode=ro` and `query_only`. The source folder is never opened by SQLite.
+- **Deleted rows are carved from the copy** (`plcarve.py`): free pages, freeblocks, page slack and WAL frames.
+- **Cleanup.** Copies are deleted when the window closes. If a copy cannot be removed, the viewer says so and shows the path. On start it reports copy folders left by earlier runs.
+- **Secrets are never read.** Not read: the Bluetooth link keys, `PlatformEncryptedKeyStorage.json` and certificate bodies (only counted).
+- **Read-only access to the live PC.** The cable / Bluetooth section reads the live registry and logs, and changes nothing.
+
+### The window
+
+- **Left: the views,** grouped as:
+  - **Linked phones (this PC)**
+  - **Phone connections – USB cable and Bluetooth (this PC)**
+  - **one node per database**, holding its tables, relations *inside one table* and relations *between tables of that database*
+  - **Checks**, **SQLECmd map output** and **Provenance** (copies and hashes)
+- **Middle: the table.** Sortable columns and a filter box. The banner above it says what the view is and where its data comes from.
+- **Bottom left: the selected row**, all fields. For a notification the raw JSON is shown underneath.
+- **Bottom right: linked rows.** Each line says *how* the row is linked (in plain words), *which* row, *which table* it lives in, and whether it's in the same table, another table of the same database, or another database. **Double-click a line to jump to that row.**
+- **Top bar:**
+  - **Show cross-database links**: off by default, because those links are the tool's inferences.
+  - **Nearby (min)**: the window used for "events close in time".
+  - **Open folder…** and **Export view (CSV)**.
+
+Every link carries its basis, colour-coded:
+
+| Kind | Colour | Meaning |
+|---|---|---|
+| Inside one table | green | Rows of the same table that belong together, or data packed inside one row |
+| Between tables of one database | teal | Tables in the same `.db` joined by an ID column |
+| Stored link | (in the text) | The ID is written in the data itself |
+| Inferred | orange / labelled | The tool's own join, for example by time or phone number. It is never stored on the device |
+| Checks | red | Rows whose partner is missing, or counts that disagree |
+
+### Linked phones (this PC)
+
+Every phone that has ever been linked to the PC through Phone Link, **including phones whose data Phone Link has since removed**. Open the package folder to see it.
+
+| View | Source | What it shows |
+|---|---|---|
+| Phone pairings | `LocalCache\Indexed\<GUID>\` | One row per pairing, oldest first. The folder's creation time is when that phone was linked. Status: *data present* / *databases present but empty* / *folder only (data removed)*. Also: databases left, row counts, first/last activity, SIM, apps streamed |
+| Phone details | `LocalCache\DeviceMetadataStorage.json` | Per hardware ID: display name, manufacturer, model, Android version, Phone Link app version, capabilities, linked/enabled, registration and last-seen times. A hardware ID without details is a phone that was unlinked |
+| Trust relationships | `LocalCache\YppCryptoTrustRelationships` | Partner device, trust type, last access, key expiry, Microsoft account ID (MsaCid) |
+| Apps streamed per device | `LocalCache\Indexed\FullTrust\phone_apps.db` | `hosted_app_ids`: one row per app a phone streamed to the PC |
+| Pairing history | all of the above | Every linked-phone event in time order |
+
+How they connect:
+- **Stored:** a trust relationship's partner ID is `<prefix>_<metadata Id>`.
+- **Stored:** `hosted_app_ids.device_id` is the pairing folder's name.
+- **Inferred by time:** the phone details are matched to the closest pairing folder created within 10 minutes after registration.
+
+### Phone connections: USB cable and Bluetooth (this PC)
+
+Phones that reached the PC **without** Phone Link. This section reads the **live** registry, setup logs and event logs of the computer the viewer runs on, so it describes *that* PC, never an evidence folder from another one. It appears only with `--this-pc`, or when `--input` is this PC's own Phone Link folder.
+
+| View | What it shows |
+|---|---|
+| Phones (summary) | Every trace that looks like a phone, with the evidence: a phone driver on USB, the same ContainerID as a USB phone, Bluetooth class of device = Phone, or an MTP event 1005 naming the phone's make, model and OS version. Event 1005 also catches iPhones, which have no phone-specific driver |
+| USB devices | Name, manufacturer, VID/PID, serial, driver, ContainerID, first install, key last-write time |
+| Portable devices (MTP) | The name shown in *This PC* when a phone was plugged in |
+| Bluetooth devices | Name, class of device, manufacturer ID, LMP version, VID/PID, **LastSeen**, **LastConnected** |
+| Bluetooth services | Each profile a device offered: Hands-Free, Phonebook Access, Message Access, A2DP, … |
+| Bluetooth LE | Low Energy devices and the GATT services they offered |
+| AutoPlay known devices | The label AutoPlay showed this Windows user |
+| First driver install | The earliest time each device ID was installed, across the current and rotated setup logs |
+| Connection events | Event-log entries with Windows' own meaning for each ID |
+
+Stored links between them:
+- **Same physical device:** USB, MTP, Bluetooth and AutoPlay entries that share a ContainerID.
+- **Bluetooth device → its services:** the address is in the service's instance ID.
+- **Device → its first install and its events:** the device ID is in the log line or event.
+
+### Where Windows stores phone connection traces
+
+Checked on Windows 11 with a standard (non-admin) account. *Read by the tool* says whether the viewer uses the location.
+
+**USB cable**
+
+| Location | What is stored | Readable without admin | Read by the tool |
+|---|---|---|---|
+| `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_xxxx&PID_yyyy\<serial>` | One entry per USB device: VID/PID, **serial number** (the key name), description, manufacturer, driver service, `ContainerID` | yes | yes |
+| `…\Enum\USB\…\<serial>\Properties\{83da6326-97a6-4088-9453-a1923f573b29}\0064` / `0065` / `0066` / `0067` | Install date / first install date / last arrival (connected) / last removal. `0067` exists only after the device was removed | **no** (SYSTEM only) | no |
+| `HKLM\SYSTEM\CurrentControlSet\Enum\SWD\WPDBUSENUM\<id>` | The phone as a portable device (MTP): name, manufacturer, `ContainerID` | yes | yes |
+| `HKLM\SOFTWARE\Microsoft\Windows Portable Devices\Devices\<id>` | The portable device's display name | yes | yes |
+| `HKLM\SYSTEM\CurrentControlSet\Control\DeviceContainers\{ContainerID}` | One container per physical device. Every `ContainerID` in the entries above points to one. Windows usually keeps a phone's USB and Bluetooth sides in separate containers. Its `Properties` subkey is SYSTEM only | yes (`BaseContainers`) | via `ContainerID` |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers\KnownDevices\<id>` | Per Windows user: the label AutoPlay showed, `ContainerID`, icon | yes | yes |
+| `HKLM\SYSTEM\CurrentControlSet\Enum\USBSTOR` | Only if the phone appeared as a storage drive | yes | listed with USB devices |
+| `C:\Windows\INF\setupapi.dev.log` and rotated `setupapi.dev.<date>.log` | First time a driver was installed for a device ID (local time) | yes | yes |
+| Event log `Microsoft-Windows-Kernel-PnP/Configuration` | 400 configured · 410 started · 411 problem starting · 420 deleted · 430 requires further installation · 442 settings not migrated from a previous Windows install | yes | yes |
+| Event log `Microsoft-Windows-WPD-MTPClassDriver/Operational` | 1000 MTP driver started · 1001–1003 idle / suspend / resume · 1004 operation cancelled · **1005 driver customized for the connected device (make, model, OS version)** · 1006 driver failed to start | yes | yes |
+
+**Bluetooth**
+
+| Location | What is stored | Readable without admin | Read by the tool |
+|---|---|---|---|
+| `HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\<MAC>` | Name, class of device (`COD`; major class 2 = phone), manufacturer ID, LMP version, VID/PID, **`LastSeen`**, **`LastConnected`** (`0` = never recorded) | yes | yes |
+| `HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys\<PC MAC>\<device MAC>` | Pairing (link) keys | **no** (SYSTEM only) | **never**, these are secrets |
+| `HKLM\SYSTEM\CurrentControlSet\Enum\BTHENUM\{service}_…\<…&MAC_…>` | One entry per profile the device offered | yes | yes |
+| `HKLM\SYSTEM\CurrentControlSet\Enum\BTHLE` and `…\Enum\BTHLEDevice` | Bluetooth Low Energy devices and their GATT services | yes | yes |
+| Event log `Microsoft-Windows-Bluetooth-BthLEPrepairing/Operational` | Bluetooth LE pairing (often empty) | yes | yes |
+
+**Phone Link**
+
+All under `%LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe\LocalCache\`:
+
+| Location | What is stored |
+|---|---|
+| `Indexed\<GUID>\System\Database\` | One folder per linked phone, with its databases. The folder's creation time is when the phone was linked |
+| `DeviceMetadataStorage.json` | Phone name, maker, model, Android version, linked and last-seen times |
+| `YppCryptoTrustRelationships` | Trust with the phone: last access, key expiry, Microsoft account ID |
+| `Indexed\FullTrust\phone_apps.db` | Apps the phone streamed to the PC |
+
+A registry key's **last-write time** is shown as a lead, not as a documented connection time.
+
+### The Phone Link databases
+
+Each database is a node in the window. It holds its tables, the relations inside a table, and the relations between its tables:
+
+| Database | Relations between its tables |
+|---|---|
+| `contacts.db` | Contact -> numbers, emails, addresses, dates, URLs (`contact_id`); deleted contact details (tombstones written by triggers) |
+| `phone.db` | SMS thread -> messages / participants / MMS -> attachments; RCS thread -> chats and file transfers; RCS thread -> SMS fallback thread; thread -> pinned / muted / hidden state; outbound queue; SMS -> SIM |
+| `phoneapps.db` | Installed app -> recent app / Windows counterpart (`package_name`) |
+| `notifications.db` | See below |
+
+**Checks:**
+- **Orphans:** participants or messages whose thread no longer exists, contact details whose contact is gone, and RCS threads without their SMS fallback.
+- **Sync completeness:** each feed's sync bookmark (`content_sequence`) compared with the rows present.
+
+**Across databases** (hidden until you tick the box, because these are inferences):
+- calls / SMS / threads -> contacts, by the last 10 digits of the number;
+- calls -> SIM;
+- one profile per person across calls and SMS;
+- notifications and settings -> installed apps;
+- photo taken during a call;
+- events close in time;
+- one unified timeline.
+
+**SQLECmd map output** shows the output of all nine Phone Link maps (the five here and four stock ones) for the same copies.
+
+### notifications.db in detail
+
+Phone Link deletes a notification when it is dismissed, so the live table is often empty. The rows usually survive on free pages, so the viewer carves them.
+
+| View | What it shows |
+|---|---|
+| notifications | Live rows **and carved deleted rows** (Source = deleted, with page and offset). All 36 fields of the `json` column become columns. `flags`, `importance`, `priority` and the Android `key` (user / package / id / tag / uid) are decoded as the Android API defines them |
+| chat messages | `messages[]` with `senderNames[]`: who wrote each message inside one notification |
+| buttons | `notificationActions[]`; *InlineReply* means the notification could be answered from the PC |
+| notification_toastmappings, phone_requests | Live and carved rows |
+
+Relations inside the table:
+- **Same group** (`groupKey`; the summary row carries `FLAG_GROUP_SUMMARY`).
+- **Same conversation** (app + `conversationTitle`).
+- **Several versions of one notification** (same `key`).
+- **Plain columns vs json:** consistency checks.
+
+Relations between tables:
+- **Notification -> Windows toast.**
+- **Phone request -> notification**, only where the IDs are identical.
+- **Deleted row -> its live copy.**
+
+`isGroup` in the json means "belongs to an app-defined group" (`groupKey` differs from the notification's own `key`), not "is the group summary". That reading was measured on a small sample, so treat it as inferred.
+
+---
+
+## The SQLECmd maps
+
+The stock SQLECmd map set no longer parses some Phone Link databases and has no map at all for others.
 
 - **`photos.db` is silently skipped by the stock map.** Current Phone Link builds no longer have the `photo` table, so `Windows_YourPhone_PhotosDB.smap` v1.1 stops matching and SQLECmd lists the database as having no map. v1.2 here matches by the columns its query actually reads.
-- **Four databases have no map at all:**
-  - `calling.db`: call history
-  - `continuity.db`: phone browser pages and cross-device app handoff
-  - `phoneapps.db`: installed and recent apps, with icons
-  - `deviceData.db`: the phone's wallpaper
-
-## The maps
+- **Four databases had no map:** `calling.db`, `continuity.db`, `phoneapps.db`, `deviceData.db`.
 
 | Map | Database | What you get |
 |---|---|---|
@@ -28,137 +281,70 @@ Five SQLECmd maps for Microsoft Phone Link (formerly Your Phone) on Windows 11. 
 | `Windows_YourPhone_PhoneAppsDB.smap` | `phoneapps.db` | Installed apps (icons as PNG), recent apps, Android ↔ Windows app links |
 | `Windows_YourPhone_DeviceDataDB.smap` | `deviceData.db` | The linked phone's wallpaper image |
 
-Location: `%LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe\LocalCache\Indexed\<device GUID>\System\Database\`
+The stock maps for `contacts.db`, `phone.db`, `notifications.db` and `settings.db` still match current builds and are not duplicated here.
 
-The existing stock maps for `contacts.db`, `phone.db`, `notifications.db` and `settings.db` still match current builds and are not duplicated here.
-
-## Use
+**Use**
 
 1. Copy the `.smap` files into SQLECmd's `Maps` folder, or point `--maps` at this repo's `maps` folder.
-2. **Work on copies.** SQLECmd writes `-shm`/`-wal` files beside the databases it opens. Collect each `.db` together with its `-wal` and `-shm`, because recent rows can exist only in the `-wal`.
+2. **Work on copies.** SQLECmd opens databases read-write and writes `-shm`/`-wal` files beside them. Collect each `.db` together with its `-wal` and `-shm`, because recent rows can exist only in the `-wal`.
 3. Run it:
    ```
    SQLECmd.exe -d <copied folder> --hunt --maps <maps folder> --csv <out>\csv --blobdir <out>\blobs
    ```
 
-## Design rules the maps follow
+**Design rules**
 
-- **A map only matches a database its queries can run on.** Every IdentifyQuery checks the exact columns the queries read, and that those tables are real tables (a planted view does not match).
+- **A map only matches a database its queries can run on.** Every IdentifyQuery checks the exact columns the queries read, and that they are real tables: a planted view does not match.
 - **Times are never invented.** A timestamp of 0, a negative value, text, or a value past year 9999 gives an empty time, never 1601-01-01. Raw columns keep the stored value as text.
-- **Nothing is dropped or duplicated.** Joins to related tables are pre-grouped, so one source row gives exactly one output row.
+- **Nothing is dropped or duplicated.** Joins are pre-grouped, so one source row gives exactly one output row.
 - **Every blob is written, once.**
-  - File names come from a unique key: `{app_id}_{package}` for icons, `MediaID` for thumbnails, the primary key elsewhere. SQLECmd otherwise cuts names to 50 characters and silently overwrites duplicates.
-  - Blob columns are always real BLOB values, so SQLECmd's CSV columns stay aligned. With a NULL or text value in a blob column, SQLECmd shifts `SourceFile` out of place.
+  - File names come from a unique key, because SQLECmd otherwise cuts names to 50 characters and silently overwrites duplicates.
+  - Blob columns are always real BLOB values, so SQLECmd's CSV columns stay aligned.
 - **Unconfirmed epochs are labelled.** They are converted by size, with the raw value kept beside them.
 - **Fast on large databases.** In a stress test, 1,000,000 calls, 500,000 photos and 20,000 apps with icons ran through SQLECmd in about 85 s.
 
-## SQLECmd behaviours to know (not fixable in a map)
+**SQLECmd behaviours to know** (not fixable in a map)
 
 - It writes `-shm`/`-wal` files beside its input, so run it on copies.
-- It skips a database that is locked, or held open by another process, and still exits with code 0.
+- It skips a database that is locked or held open by another process, and still exits with code 0.
 - It ignores a `-wal` whose header doesn't match the database, without warning.
 - It has no query timeout, so a crafted view can make it run forever.
-- It converts a value whose stored type differs from the column's declared type: text in an INTEGER column becomes 0 or its leading number. The `*Raw` columns are cast to text so the stored value survives. Other plain columns (ranks, heights, task IDs) would show the converted value if a database ever held text there.
-- CSV cells hold values exactly as stored, including leading `=` `+` `-` `@` and NUL characters. Open the CSVs as text or in Timeline Explorer, not by double-clicking them into Excel.
+- It converts a value whose stored type differs from the column's declared type: text in an INTEGER column becomes 0 or its leading number. The `*Raw` columns are cast to text so the stored value survives.
+- CSV cells hold values exactly as stored, including leading `=` `+` `-` `@`. Open the CSVs as text or in Timeline Explorer, not by double-clicking them into Excel.
 
-## Limitations
-
-- Tested against one current Windows 11 build (October 2026) and one linked Android phone. Older or newer Phone Link builds may change the schema; the IdentifyQueries then fail to match rather than give wrong output.
-- `continuity.db` and `pcapp_data` were empty on the test system, so their queries are tested on synthetic rows only, and their epochs are inferred by size.
-- The main PhotosDB CSV does not flag which photos have a thumbnail; match the Thumbnails CSV on `MediaID`.
-- iPhone pairings were not tested.
-
-## Relations viewer
-
-Python 3.8+, standard library only (Tkinter). Nothing to install.
-
-```
-python viewer/plmapview.py --demo                     # synthetic data, nothing real
-python viewer/plmapview.py --input "<...\LocalCache\Indexed\<device GUID>\System\Database>"
-python viewer/plmapview.py --input "%LOCALAPPDATA%\Packages\Microsoft.YourPhone_8wekyb3d8bbwe"    # this PC: adds cable/Bluetooth
-```
-
-**Evidence handling:**
-- The input folder is **copied** to a temporary folder (every `.db` with its `-wal` and `-shm`).
-- Every copy is **re-hashed (SHA-256) against its source**, and a mismatch stops the load.
-- The copies are opened **read-only** and deleted when the window closes.
-- Deleted rows are **carved from the copy**, never from the source.
-
-**Layout:** the window is organised **by database**. Open a database to see:
-1. **Its tables:** packed data is unpacked. For example, a notification's `json` column becomes 36 columns.
-2. **Relations inside one table:** rows that belong together, or data packed inside a row.
-3. **Relations between the tables of that database:** joined by an ID column.
-
-Select a row and the panel lists every linked row. It says in plain words how each one is linked and which table it is in; double-click a link to jump to it. Links **between different databases** (for example a call matched to a contact by number) are inferences, hidden until you tick *Show cross-database links*.
-
-**Linked phones (this PC):** every phone that has ever been linked to this PC, even ones whose data Phone Link has since removed. Open the package folder (`...\Packages\Microsoft.YourPhone_8wekyb3d8bbwe`) to see it.
-
-| View | Source | What it shows |
-|---|---|---|
-| Phone pairings | `LocalCache\Indexed\<GUID>\` | One row per pairing, oldest first. The folder's creation time is when that phone was linked. Status: data present / databases present but empty / folder only (data removed). Databases left, row counts, first/last activity, SIM, apps streamed |
-| Phone details | `DeviceMetadataStorage.json` | Per hardware ID: display name, manufacturer, model, Android version, Phone Link app version, capabilities, linked/enabled, registration and last-seen times. A hardware ID with no details is a phone that was unlinked |
-| Trust relationships | `YppCryptoTrustRelationships` | Partner device, trust type, last access, key expiry, Microsoft account ID (MsaCid) |
-| Apps streamed per device | `Indexed\FullTrust\phone_apps.db` | `hosted_app_ids`, one row per app a phone streamed to the PC |
-| Links | | Phone details -> trust relationship (**stored**: the partner ID is `<prefix>_<metadata Id>`); pairing folder -> streamed apps (**stored**: `device_id` is the folder name); phone details -> pairing folder (**inferred by time**: the closest folder created within 10 minutes after registration); one pairing history in time order |
-
-`PlatformEncryptedKeyStorage.json` (encryption keys) is never copied, and certificate bodies are never shown, only counted. The package files are copied and hash-verified like the databases.
-
-**Phone connections - USB cable and Bluetooth (this PC):** phones that reached this PC without Phone Link. This section reads the **live** registry, setup logs and event logs of the computer the viewer runs on, read-only. So it describes *this* PC, never an evidence folder, and it appears only with `--this-pc`, or when `--input` is this PC's own Phone Link folder.
-
-| View | Where Windows keeps it | What it shows |
-|---|---|---|
-| Phones (summary) | all of the below | Every trace that looks like a phone, with the evidence: a phone driver on USB (`WUDFWpdMtp`, `dg_ssudbus`, modem), the same ContainerID as a USB phone, or Bluetooth class of device = Phone |
-| USB devices | `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_xxxx&PID_yyyy\<serial>` | Name, manufacturer, VID/PID, serial, driver, ContainerID, first install, key last-write |
-| Portable devices (MTP) | `HKLM\SYSTEM\CurrentControlSet\Enum\SWD\WPDBUSENUM`, `HKLM\SOFTWARE\Microsoft\Windows Portable Devices\Devices` | The name shown in This PC when a phone was plugged in |
-| Bluetooth devices | `HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\<MAC>` | Name, class of device, manufacturer ID, LMP version, VID/PID, **LastSeen**, **LastConnected** |
-| Bluetooth services | `HKLM\SYSTEM\CurrentControlSet\Enum\BTHENUM` | Each profile a device offered: Hands-Free, Phonebook Access, Message Access, A2DP, ... |
-| AutoPlay known devices | `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers\KnownDevices` | The label AutoPlay showed this user |
-| First driver install | `C:\Windows\INF\setupapi.dev.log` and the rotated `setupapi.dev.<date>.log` copies | The earliest time each device id was installed (local time as logged) |
-| Connection events | Event logs `Kernel-PnP/Configuration`, `WPD-MTPClassDriver/Operational`, `Bluetooth-BthLEPrepairing/Operational` | Device configured / started / MTP events, newest first. Logs roll over |
-| Links | | Same physical device across USB, MTP, Bluetooth and AutoPlay (**stored**: ContainerID); Bluetooth device -> its services (**stored**: address in the instance id); device -> first install and -> events (**stored**: device id) |
-
-No admin is needed. Two things are deliberately not read: the Bluetooth link keys (`BTHPORT\Parameters\Keys`, secrets), and the exact install / first / last arrival times under `Enum\...\Properties` (SYSTEM-only). The key last-write time is shown as a lead, not as a documented connection time.
-
-**notifications.db (first database done):**
-- **Rows:** live rows plus rows carved from free pages (Source = deleted, with page and offset).
-- **JSON:** every field becomes a column. `flags`, `importance`, `priority` and the Android `key` are decoded as the Android API defines them.
-- **Sub-tables:** chat messages with their senders, and notification buttons (inline reply).
-- **Relations inside the table:** same group, same conversation, several versions of one notification, and columns-vs-json consistency.
-- **Relations between tables:** notification -> Windows toast; phone request -> notification (only where the IDs are identical); deleted row -> its live copy.
-- **A caution:** `isGroup` in the json means "belongs to an app-defined group", not "is the group summary". That reading is measured on a small sample, so treat it as inferred.
-
-The other databases already have relations between their tables (contacts, SMS threads / messages / participants / MMS / RCS, SIM, apps). Their relations inside each table are added one database at a time.
-
-| File | What it is |
-|---|---|
-| `viewer/plmapview.py` | The viewer |
-| `viewer/plrelate.py` | Relation engine: copies and hashes, entities, links, relation tables, SQLECmd map output |
-| `viewer/plnotif.py` | notifications.db: live and carved rows, json unpacked and decoded, its relations |
-| `viewer/pldevices.py` | Linked phones: every pairing folder, phone details, trust relationships, streamed apps |
-| `viewer/plconnect.py` | Phone connections over USB cable and Bluetooth: live registry, setup logs, event logs (this PC only) |
-| `viewer/plparse.py`, `viewer/plcarve.py` | Copy-first staging, address normalisation and time conversion; schema-guided SQLite carver |
-| `viewer/pldemo.py` | A synthetic device folder with known relations, including deleted notifications on free pages |
-| `viewer/maps-upstream/` | The four stock SQLECmd Phone Link maps, unchanged (authors in each file), so the viewer can show their output too |
+---
 
 ## Tests
 
-See [docs/TESTING.md](docs/TESTING.md). To run them:
+All tests use synthetic data. GitHub Actions runs them on every push (badge at the top).
 
-```
+```bash
 pip install pyyaml yamllint
 yamllint -c .yamllint maps
-python tests/run_tests.py                                         # emulator, synthetic data
-python tests/run_tests.py --sqlecmd C:\Tools\SQLECmd.exe           # plus the real SQLECmd
-python tests/stress.py C:\Tools\SQLECmd.exe                        # large synthetic databases
-python viewer/test_plrelate.py                                     # viewer: 32 relation tests, planted answers
-python viewer/test_plmapview.py                                    # viewer: 10 GUI tests
-python viewer/test_pldevices.py                                    # viewer: 9 linked-phones tests
-python viewer/test_plconnect.py                                    # viewer: 11 cable/Bluetooth tests (synthetic registry)
+python tests/run_tests.py                          # maps: emulator of SQLECmd's matching, answer-key data
+python tests/run_tests.py --sqlecmd C:\Tools\SQLECmd.exe   # maps: also the real SQLECmd
+python tests/stress.py C:\Tools\SQLECmd.exe        # maps: large synthetic databases
+python viewer/test_plrelate.py                     # viewer: relations, planted answers
+python viewer/test_pldevices.py                    # viewer: linked phones
+python viewer/test_plconnect.py                    # viewer: USB cable / Bluetooth (synthetic registry)
+python viewer/test_plmapview.py                    # viewer: the window itself
 ```
+
+See [docs/TESTING.md](docs/TESTING.md) for how the maps were tested.
+
+---
+
+## Limitations
+
+- Tested against Windows 11 Phone Link builds from 2026 with linked Android phones. A future Phone Link build may change the schema. The maps' IdentifyQueries then fail to match rather than give wrong output, and the viewer shows what it finds.
+- `continuity.db` and `pcapp_data` were empty on the test systems, so those queries are tested on synthetic rows, and their epochs are inferred by size.
+- Carving recovers what SQLite left in free space. A recovered row is matched by its record shape, not proven, and each one shows the page and offset it came from.
+- The USB install / first / last-arrival times under `Properties` need SYSTEM rights and are not read. The key last-write time is a lead, not a connection time.
+- iPhone pairings with Phone Link were not tested.
 
 ## Related
 
-Capability Access Manager (camera, microphone and location usage) maps are a separate repo: [sqlecmd-maps-capabilityaccessmanager](https://github.com/whitedevil1026/sqlecmd-maps-capabilityaccessmanager).
+Capability Access Manager (camera, microphone and location usage) maps are a separate tool: [sqlecmd-maps-capabilityaccessmanager](https://github.com/whitedevil1026/sqlecmd-maps-capabilityaccessmanager).
 
 ## Credits
 

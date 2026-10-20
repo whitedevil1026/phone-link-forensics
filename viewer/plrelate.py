@@ -108,6 +108,7 @@ class Evidence:
                     self.verify.append({"file": row["file"] + suffix, "source_sha256": row[key],
                                         "copy_matches": "yes" if ok else "NO"})
         if any(v["copy_matches"] != "yes" for v in self.verify):
+            shutil.rmtree(self.work, ignore_errors=True)  # do not leave a bad copy behind
             raise IOError("a staged copy does not match its source hash")
         self._con = {}
 

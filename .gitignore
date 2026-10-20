@@ -16,3 +16,6 @@ out/
 blobs/
 __pycache__/
 *.pyc
+
+# README screenshots (synthetic demo only, each reviewed and hash-listed in the local leak gate)
+!docs/images/*.png

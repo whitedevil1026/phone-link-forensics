@@ -66,11 +66,13 @@ def _dpi_aware():
 
 
 class Viewer(tk.Tk):
-    def __init__(self, devices, window_min=R.DEFAULT_WINDOW_MIN, initial=None, localcache=None, connections=None):
+    def __init__(self, devices, window_min=R.DEFAULT_WINDOW_MIN, initial=None, localcache=None, connections=None,
+                 redact=False):
         _dpi_aware()
         super().__init__()
         self.devices = devices
         self.localcache = localcache
+        self.redact = redact  # demo / screenshots: never show this computer's real paths
         self.connections = C.CachedSource(connections) if connections is not None else None
         self.pc = None
         self.leftovers = []
@@ -214,16 +216,17 @@ class Viewer(tk.Tk):
             messagebox.showerror("Could not load", f"{path}\n\n{type(e).__name__}: {e}")
             return
         self.config(cursor="")
-        self.src_lbl.config(text=f"{label}  -  {path}")
+        self.src_lbl.config(text=f"{label}  -  {self._shown(path)}")
         ok = sum(v["copy_matches"] == "yes" for v in self.ev.verify)
-        self.status.config(text=f"Read-only COPIES in {self.ev.work}  |  {ok}/{len(self.ev.verify)} copies match "
+        self.status.config(text=f"Read-only COPIES in {self._shown(self.ev.work)}  |  {ok}/{len(self.ev.verify)} copies match "
                                 f"their source SHA-256  |  the source folder is never opened by SQLite  |  "
                                 f"{len(self.g.relations)} relations, "
                                 f"{sum(len(x) for x in self.g.edges.values()) // 2:,} links")
-        old = stale_copies(exclude=[self.ev.work] + ([self.pc.work] if self.pc else []))
+        old = [] if self.redact else stale_copies(exclude=[self.ev.work] + ([self.pc.work] if self.pc else []))
         if old:
             self.status.config(text=self.status.cget("text") + f"  |  {len(old)} leftover copy folder(s) from earlier "
-                                                                 f"runs in {os.path.dirname(old[0])} - remove when done")
+                                                                 f"runs in {self._shown(os.path.dirname(old[0]))} - "
+                                                                 f"remove when done")
         self.fill_nav()
         self.show(initial or self.cur_vid or "N_notifications")
 
@@ -254,6 +257,9 @@ class Viewer(tk.Tk):
             except OSError as e:
                 self.g.add_view(R.View("C_phones", "Phone connections", "conn", f"could not read: {e}", ["Error"],
                                        [{"Error": str(e)}]))
+
+    def _shown(self, path):
+        return "(synthetic demo folder)" if self.redact else path
 
     def _remember(self, leftover):
         if leftover:
@@ -395,13 +401,14 @@ class Viewer(tk.Tk):
         self.link_targets = {}
         n = 0
         own = row.get("_e")
-        for ent in self.row_entities(row):
+        mine = self.row_entities(row)
+        for ent in mine:
             for rid, target, note in sorted(self.g.links(ent), key=lambda x: (x[0], str(x[1]))):
                 rv = self.g.views.get(rid)
                 scope = rv.kind if rv else "in-table"
                 if scope == "cross" and not self.show_cross.get():
                     continue
-                if target == own:
+                if target == own or target in mine:   # the row's own entities are not "linked rows"
                     continue
                 home = self.g.home.get(target)
                 where = ""
@@ -471,16 +478,74 @@ class Viewer(tk.Tk):
         self.destroy()
 
     def screenshot(self, path):
-        """Save the window to a PNG (needs Pillow). Used for verification."""
-        from PIL import ImageGrab
+        """Save the window to a PNG (needs Pillow). Captures the window itself, not the screen behind it."""
         self.deiconify()
-        self.lift()
-        self.attributes("-topmost", True)  # make sure the window, not whatever is behind it, is captured
         self.update()
-        self.after(300)
+        self.after(500)
         self.update()
-        x, y = self.winfo_rootx(), self.winfo_rooty()
-        ImageGrab.grab(bbox=(x, y, x + self.winfo_width(), y + self.winfo_height())).save(path)
+        img = None
+        if os.name == "nt":
+            try:
+                img = self._print_window()
+            except (OSError, ValueError, AttributeError):
+                img = None
+        if img is None:
+            from PIL import ImageGrab
+            self.lift()
+            self.update()
+            x, y = self.winfo_rootx(), self.winfo_rooty()
+            img = ImageGrab.grab(bbox=(x, y, x + self.winfo_width(), y + self.winfo_height()))
+        img.save(path)
+
+    def _print_window(self):
+        """Win32 PrintWindow(PW_RENDERFULLCONTENT): renders the window even when it is covered or off-screen."""
+        import ctypes
+        from ctypes import wintypes
+        from PIL import Image
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetWindowDC.restype = wintypes.HDC
+        user32.GetWindowDC.argtypes = [wintypes.HWND]
+        user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+        gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+        gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        gdi32.DeleteDC.argtypes = [wintypes.HDC]
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+                        ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+
+        gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, ctypes.c_void_p,
+                                    ctypes.POINTER(BITMAPINFOHEADER), wintypes.UINT]
+        hwnd = user32.GetAncestor(self.winfo_id(), 2)  # GA_ROOT
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        hdc = user32.GetWindowDC(hwnd)
+        mdc = gdi32.CreateCompatibleDC(hdc)
+        bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+        gdi32.SelectObject(mdc, bmp)
+        try:
+            if not user32.PrintWindow(hwnd, mdc, 2):
+                return None
+            bmi = BITMAPINFOHEADER(40, w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+            buf = ctypes.create_string_buffer(w * h * 4)
+            if not gdi32.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(bmi), 0):
+                return None
+            return Image.frombuffer("RGB", (w, h), buf, "raw", "BGRX", 0, 1)
+        finally:
+            gdi32.DeleteObject(bmp)
+            gdi32.DeleteDC(mdc)
+            user32.ReleaseDC(hwnd, hdc)
 
 
 def stale_copies(exclude=()):
@@ -514,17 +579,19 @@ def main():
         import pldemo
         root = pldemo.build_package(tempfile.mkdtemp(prefix="pldemo-"))
         devices = [(f"demo (synthetic) {lbl}", d) for lbl, d in P.find_device_dirs(root)]
+        devices.sort(key=lambda d: -len([f for f in os.listdir(d[1]) if f.endswith(".db")]))  # fullest first
         localcache = D.find_localcache(root)
         connections = C.demo_source()
     else:
         devices = P.find_device_dirs(os.path.expandvars(a.input))
         if not devices:
             sys.exit(f"No Phone Link databases found under {a.input}")
+        devices.sort(key=lambda d: -len([f for f in os.listdir(d[1]) if f.endswith(".db")]))  # fullest first
         localcache = D.find_localcache(a.input)
         own = os.path.normcase(os.path.abspath(os.path.expandvars("%LOCALAPPDATA%")))
         is_this_pc = os.path.normcase(os.path.abspath(os.path.expandvars(a.input))).startswith(own)
         connections = C.LiveSource() if (a.this_pc or is_this_pc) and os.name == "nt" else None
-    app = Viewer(devices, a.window, a.view, localcache, connections)
+    app = Viewer(devices, a.window, a.view, localcache, connections, redact=a.demo)
     if a.select is not None:
         app.show(app.cur_vid, select_index=a.select)
         app.on_row()

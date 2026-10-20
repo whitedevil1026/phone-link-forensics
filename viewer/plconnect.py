@@ -41,6 +41,8 @@ WPD = r"SYSTEM\CurrentControlSet\Enum\SWD\WPDBUSENUM"
 WPD_NAMES = r"SOFTWARE\Microsoft\Windows Portable Devices\Devices"
 BTPORT = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices"
 BTENUM = r"SYSTEM\CurrentControlSet\Enum\BTHENUM"
+BTLE = r"SYSTEM\CurrentControlSet\Enum\BTHLE"
+BTLE_SVC = r"SYSTEM\CurrentControlSet\Enum\BTHLEDevice"
 KNOWN = r"Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers\KnownDevices"
 SETUPAPI = r"C:\Windows\INF\setupapi.dev.log"
 CHANNELS = ["Microsoft-Windows-Kernel-PnP/Configuration", "Microsoft-Windows-WPD-MTPClassDriver/Operational",
@@ -58,6 +60,19 @@ BT_SERVICES = {"1101": "Serial Port", "1103": "Dial-up Networking", "1105": "OBE
                "111e": "Hands-Free", "111f": "Hands-Free Audio Gateway", "112f": "Phonebook Access (server)",
                "1132": "Message Access (server)", "1133": "Message Notification (server)", "1200": "PnP Information",
                "1800": "Generic Access (Bluetooth LE)", "1801": "Generic Attribute (Bluetooth LE)"}
+# [measured] Windows' own message text for each event ID, read from this PC's event logs
+EVENT_MEANING = {
+    ("Kernel-PnP", "400"): "device was configured", ("Kernel-PnP", "410"): "device was started",
+    ("Kernel-PnP", "411"): "device had a problem starting", ("Kernel-PnP", "420"): "device was deleted",
+    ("Kernel-PnP", "430"): "device requires further installation",
+    ("Kernel-PnP", "442"): "device settings were not migrated from a previous Windows installation",
+    ("WPD-MTPClassDriver", "1000"): "MTP driver started", ("WPD-MTPClassDriver", "1001"): "device will suspend when idle",
+    ("WPD-MTPClassDriver", "1002"): "device entering idle state", ("WPD-MTPClassDriver", "1003"): "device resuming from idle",
+    ("WPD-MTPClassDriver", "1004"): "driver cancelled an operation",
+    ("WPD-MTPClassDriver", "1005"): "MTP driver customized for a connected device (make, model, OS version)",
+    ("WPD-MTPClassDriver", "1006"): "MTP driver failed to start",
+}
+
 # driver services that indicate a phone on USB (the evidence for the flag is shown with it)
 PHONE_SERVICES = {"WUDFWpdMtp": "MTP phone/camera driver", "dg_ssudbus": "vendor phone USB driver",
                   "Modem": "phone modem interface", "ssudmdm": "vendor phone modem"}
@@ -133,6 +148,8 @@ class LiveSource:
 
 class FakeSource:
     """Synthetic source for tests and the demo: {(hive, path): {"values": {...}, "subkeys": [...], "lw": int}}."""
+
+    logs_in_utc = True   # synthetic logs: no time zone of the running PC is applied
 
     def __init__(self, keys, text="", events=None):
         self.keys, self._text, self._events, self.denied = keys, text, events or {}, []
@@ -236,10 +253,15 @@ def parse_setupapi(text):
     return out
 
 
-def local_to_utc(s):
-    """setupapi.dev.log logs local time; convert with this PC's current UTC offset (labelled as such)."""
+def local_to_utc(s, logs_in_utc=False):
+    """setupapi.dev.log logs local time; convert with this PC's current UTC offset (labelled as such).
+
+    Synthetic sources set logs_in_utc so the demo never reveals the running PC's time zone."""
     try:
-        t = dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").astimezone()
+        t = dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        if logs_in_utc:
+            return t.strftime("%Y-%m-%d %H:%M:%S")
+        t = t.astimezone()
         return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         return ""
@@ -249,6 +271,10 @@ def local_to_utc(s):
 def build(src, g, View):
     """Add the 'Phone connections (this PC)' views to graph g. Returns view ids."""
     vids, by_container, by_instance = [], {}, {}
+    utc_logs = getattr(src, "logs_in_utc", False)
+
+    def to_utc(s):
+        return local_to_utc(s, utc_logs)
 
     def add(vid, title, basis, cols, rows, entity=True):
         v = View(vid, title, "conn", basis, cols, rows)
@@ -287,7 +313,7 @@ def build(src, g, View):
                          "SerialOrInstance": inst, "Driver": svc,
                          "PhoneEvidence": PHONE_SERVICES.get(svc, ""), "ContainerID": v.get("ContainerID", ""),
                          "Location": v.get("LocationInformation", ""), "FirstInstallLocal": first,
-                         "FirstInstallUTC": local_to_utc(first), "KeyLastWriteUTC": filetime(src.last_write(HKLM, path)),
+                         "FirstInstallUTC": to_utc(first), "KeyLastWriteUTC": filetime(src.last_write(HKLM, path)),
                          "HardwareID": multi(v.get("HardwareID")), "InstanceID": iid})
             remember(e, v.get("ContainerID"), iid)
     add("C_usb", "USB devices (cable)", "HKLM\\" + USB + " - every USB device ever installed; PhoneEvidence shows "
@@ -310,7 +336,7 @@ def build(src, g, View):
         rows.append({"_e": e, "Name": fname, "Manufacturer": clean_desc(v.get("Mfg")),
                      "Description": clean_desc(v.get("DeviceDesc")), "Driver": v.get("Service", ""),
                      "ContainerID": v.get("ContainerID", ""), "FirstInstallLocal": first,
-                     "FirstInstallUTC": local_to_utc(first), "KeyLastWriteUTC": filetime(src.last_write(HKLM, path)),
+                     "FirstInstallUTC": to_utc(first), "KeyLastWriteUTC": filetime(src.last_write(HKLM, path)),
                      "InstanceID": iid})
         remember(e, v.get("ContainerID"), iid)
     add("C_wpd", "Portable devices (MTP phones, cameras, volumes)",
@@ -370,6 +396,33 @@ def build(src, g, View):
         "from the Bluetooth SIG assigned numbers", ["Service", "Address", "Name", "Driver", "ContainerID",
                                                    "KeyLastWriteUTC", "InstanceID"], rows)
 
+    # Bluetooth LE devices and their GATT services
+    rows = []
+    for base, kind in ((BTLE, "LE device"), (BTLE_SVC, "LE service")):
+        for sub in src.subkeys(HKLM, base):
+            for inst in src.subkeys(HKLM, f"{base}\\{sub}"):
+                path = f"{base}\\{sub}\\{inst}"
+                v = src.values(HKLM, path)
+                am = re.findall(r"([0-9A-Fa-f]{12})", inst) or re.findall(r"Dev_([0-9A-Fa-f]{12})", sub)
+                addr = am[-1].lower() if am else ""
+                um = re.match(r"\{0000([0-9a-fA-F]{4})-0000-1000-8000-00805f9b34fb\}", sub)
+                u128 = re.match(r"\{([0-9a-fA-F-]{36})\}", sub)
+                service = (BT_SERVICES.get(um.group(1).lower(), f"UUID {um.group(1).lower()}") if um else
+                           f"vendor-specific service {u128.group(1)}" if u128 else "")
+                iid = f"{base.rsplit(chr(92), 1)[-1]}\\{sub}\\{inst}"
+                e = ("btle", iid)
+                name = clean_desc(v.get("FriendlyName")) or clean_desc(v.get("DeviceDesc"))
+                g.label[e] = f"Bluetooth {kind} {name or service} on {mac(addr) if addr else '?'}"
+                rows.append({"_e": e, "Kind": kind, "Name": name, "Service": service,
+                             "Address": mac(addr) if addr else "", "ContainerID": v.get("ContainerID", ""),
+                             "KeyLastWriteUTC": filetime(src.last_write(HKLM, path)), "InstanceID": iid})
+                remember(e, v.get("ContainerID"), iid)
+                if addr in bt:
+                    g.link("CR2", bt[addr], e, f"Stored link: the LE instance carries this device's address ({kind})")
+    add("C_btle", "Bluetooth LE devices and services",
+        "HKLM\\" + BTLE + " and HKLM\\" + BTLE_SVC + " - Bluetooth Low Energy devices and the GATT services they "
+        "offered", ["Kind", "Name", "Service", "Address", "ContainerID", "KeyLastWriteUTC", "InstanceID"], rows)
+
     # AutoPlay known devices
     rows = []
     for key in src.subkeys(HKCU, KNOWN):
@@ -394,7 +447,7 @@ def build(src, g, View):
         g.label[ie] = f"first install {start} - {devid[:60]}"
         if dev:
             g.link("CR3", dev, ie, "Stored link: setupapi.dev.log names this device id - its first driver install")
-        rows.append({"_e": ie, "DeviceID": devid, "FirstInstallLocal": start, "FirstInstallUTC": local_to_utc(start),
+        rows.append({"_e": ie, "DeviceID": devid, "FirstInstallLocal": start, "FirstInstallUTC": to_utc(start),
                      "Section": title, "Log": fname, "MatchedDevice": g.label.get(dev, "") if dev else ""})
     rows.sort(key=lambda r: r["FirstInstallLocal"])
     add("C_install", "First driver install (setupapi.dev.log)",
@@ -403,7 +456,7 @@ def build(src, g, View):
         ["FirstInstallLocal", "FirstInstallUTC", "DeviceID", "Section", "Log", "MatchedDevice"], rows)
 
     # events
-    rows = []
+    rows, mtp_phones = [], {}
     for ch in CHANNELS:
         for t, eid, data in src.events(ch):
             devid = next((x for x in data.values() if x.upper().startswith(DEVICE_PREFIXES)), "")
@@ -413,15 +466,26 @@ def build(src, g, View):
             ee = ("event", f"{ch}|{len(rows)}")
             log = ch.split("/")[0].replace("Microsoft-Windows-", "")
             g.label[ee] = f"event {eid} {log} {t}"
+            reported = ""
+            if log == "WPD-MTPClassDriver" and eid == "1005":
+                reported = ", ".join(x for x in (data.get("Manufacturer"), data.get("Model"), data.get("Version")) if x)
+                if reported:
+                    p = mtp_phones.setdefault(reported, {"first": t, "last": t, "n": 0, "events": []})
+                    p["first"], p["last"] = min(p["first"], t), max(p["last"], t)
+                    p["n"] += 1
+                    p["events"].append(ee)
             if dev:
                 g.link("CR4", dev, ee, f"Stored link: event {eid} in {log} names this device id")
-            rows.append({"_e": ee, "TimeUTC": t, "Log": log, "EventID": eid, "DeviceID": devid,
+            rows.append({"_e": ee, "TimeUTC": t, "Log": log, "EventID": eid,
+                         "Meaning": EVENT_MEANING.get((log, eid), ""), "ReportedDevice": reported, "DeviceID": devid,
                          "MatchedDevice": g.label.get(dev, "") if dev else "",
                          "Data": "; ".join(f"{k}={v}" for k, v in data.items() if v and v != devid)[:300]})
     rows.sort(key=lambda r: r["TimeUTC"], reverse=True)
     add("C_events", "Connection events (event logs)",
         "Kernel-PnP/Configuration (device configured / started), WPD-MTP and Bluetooth LE pairing logs. Logs roll over, "
-        "so only recent connections remain", ["TimeUTC", "Log", "EventID", "DeviceID", "MatchedDevice", "Data"], rows)
+        "so only recent connections remain. Meaning = Windows' own message text for that event ID; event 1005 names the "
+        "connected phone's make, model and OS version", ["TimeUTC", "Log", "EventID", "Meaning", "ReportedDevice",
+                                                        "DeviceID", "MatchedDevice", "Data"], rows)
 
     # same physical device across sources (ContainerID)
     rel = []
@@ -451,13 +515,24 @@ def build(src, g, View):
                                "Evidence": why, "LastConnectedUTC": r.get("LastConnectedUTC", ""),
                                "LastSeenUTC": r.get("LastSeenUTC", ""),
                                "KeyLastWriteUTC": r.get("KeyLastWriteUTC", ""),
-                               "FirstInstallUTC": r.get("FirstInstallUTC", "")})
+                               "FirstInstallUTC": r.get("FirstInstallUTC", ""), "FirstSeenUTC": ""})
+    for reported, p in sorted(mtp_phones.items(), key=lambda kv: kv[1]["first"]):
+        pe = ("mtpphone", reported)
+        g.label[pe] = f"phone over USB (MTP): {reported}"
+        for ee in p["events"]:
+            g.link("CR4", pe, ee, "Stored link: this event 1005 names the phone")
+        phones.append({"_e": pe, "How": "USB cable (MTP event 1005)", "Device": reported,
+                       "Evidence": f"MTP driver customized for this phone ({p['n']} events, "
+                                   f"{p['first'][:10]} to {p['last'][:10]})",
+                       "LastConnectedUTC": p["last"], "LastSeenUTC": "", "FirstInstallUTC": "",
+                       "KeyLastWriteUTC": "", "FirstSeenUTC": p["first"]})
     add("C_phones", "Phones connected to this PC (cable or Bluetooth) - summary",
         "every row above that looks like a phone, with the evidence for it: a phone driver on USB, the MTP portable-"
-        "device driver, or Bluetooth class of device = Phone. An empty LastConnected with a LastSeen means Windows "
-        "saw the phone but stored no connection time", ["How", "Device", "Evidence", "LastConnectedUTC", "LastSeenUTC",
-                                                        "FirstInstallUTC", "KeyLastWriteUTC"], phones,
-        entity=False)
+        "device driver, Bluetooth class of device = Phone, or an MTP event 1005 naming the phone's make, model and OS "
+        "version (this catches iPhones and other phones without a phone-specific driver). An empty LastConnected with a "
+        "LastSeen means Windows saw the phone but stored no connection time",
+        ["How", "Device", "Evidence", "FirstSeenUTC", "LastConnectedUTC", "LastSeenUTC", "FirstInstallUTC",
+         "KeyLastWriteUTC"], phones)
     if getattr(src, "denied", None):
         add("C_denied", "Locations this account could not read", "access denied - run as administrator to include them",
             ["Location"], [{"Location": d} for d in sorted(set(src.denied))], entity=False)
@@ -469,6 +544,7 @@ class CachedSource:
 
     def __init__(self, src):
         self.src, self.memo = src, {}
+        self.logs_in_utc = getattr(src, "logs_in_utc", False)
 
     @property
     def denied(self):
@@ -524,7 +600,8 @@ def demo_source():
                                              "Service": "WUDFWpdFs", "ContainerID": phone_c})
     key(HKLM, WPD_NAMES, subkeys=["EXAMPLE_MTP_PHONE"])
     key(HKLM, WPD_NAMES + r"\EXAMPLE_MTP_PHONE", {"FriendlyName": "Example Phone"})
-    key(HKLM, BTPORT, subkeys=["00005e005301", "00005e005302"])
+    key(HKLM, BTPORT, subkeys=["00005e005301", "00005e005302", "00005e005303"])
+    key(HKLM, BTPORT + r"\00005e005303", {"LEName": b"Example Watch\x00", "LastSeen": ft})
     key(HKLM, BTPORT + r"\00005e005301", {"Name": b"Example Phone\x00", "COD": 0x000204, "LastSeen": ft + 2 * 10 ** 9,
                                           "LastConnected": ft + 2 * 10 ** 9, "ManufacturerId": 117, "LmpVersion": 10})
     key(HKLM, BTPORT + r"\00005e005302", {"Name": b"Example Headset\x00", "COD": 0x000418, "LastSeen": ft,
@@ -536,6 +613,10 @@ def demo_source():
         key(HKLM, BTENUM + "\\" + sk, subkeys=["7&1a2b3c4d&0&00005E005301_C00000000"])
         key(HKLM, BTENUM + "\\" + sk + "\\7&1a2b3c4d&0&00005E005301_C00000000",
             {"DeviceDesc": "Example Phone", "ContainerID": "{e5e5e5e5-0000-4000-a000-000000000003}"})
+    key(HKLM, BTLE, subkeys=["Dev_00005e005303"])
+    key(HKLM, BTLE + r"\Dev_00005e005303", subkeys=["7&2b3c4d5e&0&00005e005303"])
+    key(HKLM, BTLE + r"\Dev_00005e005303\7&2b3c4d5e&0&00005e005303",
+        {"FriendlyName": "Example Watch", "ContainerID": "{e5e5e5e5-0000-4000-a000-000000000004}"})
     key(HKCU, KNOWN, subkeys=["EXAMPLE_KNOWN_1"])
     key(HKCU, KNOWN + r"\EXAMPLE_KNOWN_1", {"Label": "Example Phone", "ContainerID": phone_c})
     key(HKLM, r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys",
@@ -544,5 +625,11 @@ def demo_source():
              ">>>  Section start 2030/01/01 12:00:00.000\n<<<  Section end 2030/01/01 12:00:05.000\n")
     events = {"Microsoft-Windows-Kernel-PnP/Configuration": [
         ("2030-01-02 09:00:00", "410", {"DeviceInstanceId": "USB\\VID_1234&PID_0F01\\EXAMPLEPHONE01"}),
-        ("2030-01-02 09:00:01", "410", {"DeviceInstanceId": "PCI\\EXAMPLE_NOT_A_PHONE"})]}
+        ("2030-01-02 09:00:01", "410", {"DeviceInstanceId": "PCI\\EXAMPLE_NOT_A_PHONE"})],
+        "Microsoft-Windows-WPD-MTPClassDriver/Operational": [
+        ("2030-01-03 10:00:00", "1005", {"Manufacturer": "ExampleCorp", "Model": "Example Phone 2", "Version": "9.9",
+                                         "HackModel": "1"}),
+        ("2030-01-04 10:00:00", "1005", {"Manufacturer": "ExampleCorp", "Model": "Example Phone 2", "Version": "9.9",
+                                         "HackModel": "1"}),
+        ("2030-01-04 10:05:00", "1001", {})]}
     return FakeSource(k, setup, events)

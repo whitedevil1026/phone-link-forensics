@@ -108,6 +108,7 @@ class PackageCopy:
                             info["files"].append(rel)
                 self.folders[g] = info
         if any(v["copy_matches"] != "yes" for v in self.verify):
+            shutil.rmtree(self.work, ignore_errors=True)  # do not leave a bad copy behind
             raise IOError("a copy does not match its source hash")
 
     def _copy(self, src, dst):

@@ -56,9 +56,13 @@ class ViewerTest(unittest.TestCase):
     def test_relation_row_links_to_its_entities(self):
         self.app.show_cross.set(True)
         self.select("R20", 0)  # photo taken during a call
+        row = self.app.g.views["R20"].rows[0]
+        mine = self.app.row_entities(row)
+        self.assertIn(("call", 1), mine)              # the row is about call 1 and photo 1 ...
+        self.assertIn(("photo", 1), mine)
         targets = set(self.app.link_targets.values())
-        self.assertIn(("call", 1), targets)
-        self.assertIn(("photo", 1), targets)
+        self.assertFalse(set(mine) & targets)         # ... which are not listed as "linked rows"
+        self.assertIn(("contact", 1), targets)        # what they link to is
 
     def test_rcs_thread_does_not_link_to_unrelated_sms_thread(self):
         rcs = self.app.g.views["E_rcs"].rows
