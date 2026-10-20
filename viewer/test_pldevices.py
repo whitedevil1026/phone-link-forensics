@@ -38,6 +38,7 @@ class LinkedPhones(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.pc.close()   # the class-level package copy, or every run leaves one in %TEMP%
         cls.tmp.cleanup()
 
     def rows(self, vid):

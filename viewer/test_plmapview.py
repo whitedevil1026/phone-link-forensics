@@ -90,6 +90,27 @@ class ViewerTest(unittest.TestCase):
         self.assertEqual(rows[0], self.app.g.views["E_calls"].cols)
         self.assertEqual(len(rows), 3)
 
+    def test_sort_orders_table_keeps_filter_selection_and_export_follows(self):
+        self.app.show("E_calls")
+        self.app.filter_var.set("")
+        v = self.app.g.views["E_calls"]
+        shown = lambda: [v.rows[int(k)]["CallID"] for k in self.app.table.get_children()]
+        first = self.app.table.get_children()[0]
+        self.app.table.selection_set(first)
+        self.app.sort_by("CallID")
+        self.app.sort_by("CallID")              # second click: descending
+        ids = shown()
+        self.assertEqual(ids, sorted(ids, key=lambda x: float(x), reverse=True))
+        self.assertEqual(self.app.table.selection(), (first,))
+        out = os.path.join(self.tmp.name, "sorted.csv")
+        V.filedialog.asksaveasfilename = lambda **k: out
+        self.app.export()
+        with open(out, encoding="utf-8-sig") as f:
+            exported = [r[v.cols.index("CallID")] for r in list(csv.reader(f))[1:]]
+        self.assertEqual(exported, [str(x) for x in ids])
+        self.app.filter_var.set("Alice")        # a filter still applies after a sort
+        self.assertEqual(len(self.app.table.get_children()), 2)
+
 
 class DatabaseFirstTest(unittest.TestCase):
     def setUp(self):
@@ -111,11 +132,30 @@ class DatabaseFirstTest(unittest.TestCase):
     def test_opens_on_notifications_grouped_by_database(self):
         self.assertEqual(self.app.cur_vid, "N_notifications")
         ids = self.nav_ids()
-        self.assertIn("db:notifications.db", ids)
+        self.assertIn("grp:notifications", ids)
+        self.assertTrue(self.app.nav.item("grp:notifications", "open"))
         self.assertNotIn("R13", ids)  # cross-database links hidden by default
         self.app.show_cross.set(True)
         self.app.fill_nav()
         self.assertIn("R13", self.nav_ids())
+
+    def test_view_list_uses_plain_names(self):
+        self.app.show_cross.set(True)
+        self.app.fill_nav()
+        views = [i for i in self.nav_ids() if i in self.app.g.views]
+        self.assertEqual(sorted(views), sorted(self.app.g.views))          # every view is listed once
+        for vid in views:
+            text = self.app.nav.item(vid, "text")
+            self.assertNotRegex(text, r"^[A-Z]{1,3}\d+\b|\.db\b|_|->", vid)  # no codes, files, raw names
+            self.assertEqual(self.app.nav.set(vid, "rows"), f"{len(self.app.g.views[vid].rows):,}")
+        unnamed = [v for v in self.app.g.views if v not in V.NAV and not v.startswith("M_")]
+        self.assertEqual(unnamed, [], "give these views a plain name in plmapview.NAV")
+        self.app.show("R03")
+        self.assertEqual(self.app.title_lbl.cget("text"), "Conversation → its messages")
+        self.assertIn("Technical name: R03", self.app.basis_lbl.cget("text"))   # nothing technical is lost
+        self.app.nav.item("sub:messages:links", open=True)
+        self.app.fill_nav()                                                     # a rebuild keeps what was open
+        self.assertTrue(self.app.nav.item("sub:messages:links", "open"))
 
     def test_notification_links_are_inside_its_database(self):
         rows = self.app.g.views["N_notifications"].rows
@@ -146,7 +186,7 @@ class LinkedPhonesViewTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_linked_phones_section_and_links(self):
-        self.assertIn("PC_devices", self.app.nav.get_children("sec:pc"))
+        self.assertIn("PC_devices", self.app.nav.get_children("grp:linked"))
         rows = self.app.g.views["PC_devices"].rows
         idx = next(i for i, r in enumerate(rows) if r["Status"] == "data present")
         self.app.show("PC_devices", select_index=idx)
@@ -174,7 +214,7 @@ class ConnectionsViewTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_connections_section_summary_first_and_links(self):
-        kids = self.app.nav.get_children("sec:conn")
+        kids = self.app.nav.get_children("grp:conn")
         self.assertEqual(kids[0], "C_phones")
         rows = self.app.g.views["C_usb"].rows
         idx = next(i for i, r in enumerate(rows) if r["PhoneEvidence"])
@@ -191,7 +231,7 @@ class ConnectionsViewTest(unittest.TestCase):
         app = V.Viewer(self.app.devices, localcache=self.app.localcache)
         app.withdraw()
         try:
-            self.assertFalse(app.nav.exists("sec:conn"))
+            self.assertFalse(app.nav.exists("grp:conn"))
         finally:
             app.on_close()
 

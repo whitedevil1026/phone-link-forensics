@@ -52,6 +52,8 @@ COLS = (["Source", "RowID", "NotificationID", "Package", "PostTimeUTC", "JSONPos
         + [c for c, _ in JSON_COLS[9:]]
         + ["KeyUser", "KeyPackage", "KeyID", "KeyTag", "KeyUID", "State", "AnonymousID", "JSONStatus", "CarvedFrom"])
 
+GROUP_PAIRS_MAX = 50   # see link_group()
+
 
 def decode_flags(v):
     try:
@@ -198,6 +200,18 @@ def build(ev, g, View, ts_seconds, iso):
                      "AddedUTC", "StartedUTC", "FinishedUTC", "ExpiresUTC", "Payload"], req_rows))
 
     # ---------- relations inside the notifications table
+    def link_group(rid, members, note):
+        """Every pair in a group of up to GROUP_PAIRS_MAX rows. A bigger group (one chat app can file hundreds
+        of notifications under one groupKey) would mean n*n/2 links, so its rows are chained in time order."""
+        if len(members) <= GROUP_PAIRS_MAX:
+            for i, m in enumerate(members):
+                for other in members[i + 1:]:
+                    g.link(rid, m["_e"], other["_e"], note)
+            return
+        chain = sorted(members, key=lambda r: (r["JSONPostTimeUTC"] or r["PostTimeUTC"] or "", r["EventCount"] or 0))
+        for m, nxt in zip(chain, chain[1:]):
+            g.link(rid, m["_e"], nxt["_e"], f"{note} - group of {len(members)}, linked to the next one in time")
+
     def groups(keyfn):
         out = {}
         for r in rows:
@@ -209,9 +223,8 @@ def build(ev, g, View, ts_seconds, iso):
     rel = []
     for gk, members in groups(lambda r: r["GroupKey"]).items():
         summary = [m for m in members if "GROUP_SUMMARY" in (m["Flags"] or "")]
-        for i, m in enumerate(members):
-            for other in members[i + 1:]:
-                g.link("NR1", m["_e"], other["_e"], "Same notification group (groupKey)")
+        link_group("NR1", members, "Same notification group (groupKey)")
+        for m in members:
             rel.append({"_e": m["_e"], "GroupKey": gk, "Row": g.label[m["_e"]], "Source": m["Source"],
                         "Role": "summary" if m in summary else "member", "PostTimeUTC": m["PostTimeUTC"]})
     vids.append(add("NR1", "Same notification group (groupKey)", "in-table",
@@ -223,10 +236,8 @@ def build(ev, g, View, ts_seconds, iso):
     rel = []
     for (pkg, conv), members in groups(lambda r: (r["Package"], r["ConversationTitle"])
                                        if r["ConversationTitle"] else None).items():
+        link_group("NR2", members, f"Same conversation '{conv}' in the same app")
         for m in members:
-            for other in members:
-                if other is not m:
-                    g.link("NR2", m["_e"], other["_e"], f"Same conversation '{conv}' in the same app")
             rel.append({"_e": m["_e"], "App": m["AppName"] or pkg, "Conversation": conv, "Row": g.label[m["_e"]],
                         "Source": m["Source"], "Messages": m["Messages"], "PostTimeUTC": m["PostTimeUTC"]})
     vids.append(add("NR2", "Same conversation (app + conversationTitle)", "in-table",
@@ -236,10 +247,8 @@ def build(ev, g, View, ts_seconds, iso):
     rel = []
     for key, members in groups(lambda r: r["Key"]).items():
         members = sorted(members, key=lambda r: (r["JSONPostTimeUTC"] or "", r["EventCount"] or 0))
+        link_group("NR3", members, "Same Android notification (key) - another version of it")
         for i, m in enumerate(members):
-            for other in members:
-                if other is not m:
-                    g.link("NR3", m["_e"], other["_e"], "Same Android notification (key) - another version of it")
             rel.append({"_e": m["_e"], "Key": key, "Version": i + 1, "Row": g.label[m["_e"]], "Source": m["Source"],
                         "EventCount": m["EventCount"], "JSONPostTimeUTC": m["JSONPostTimeUTC"],
                         "Text": m["Text"]})

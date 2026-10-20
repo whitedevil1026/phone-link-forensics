@@ -15,6 +15,7 @@ Standard library only.
 import argparse
 import csv
 import os
+import re
 import sys
 import tempfile
 
@@ -44,6 +45,158 @@ KIND = {  # kind -> (heading, colour, plain meaning)
     "map": ("SQLECmd map output", "#6a1b9a", "Exactly what the SQLECmd maps return"),
     "provenance": ("Provenance", "#546e7a", "Where the copies came from and their hashes"),
 }
+# ---------------------------------------------------------------- the view list (left column)
+# Plain-English names for the view list. The technical name (view code, file, table) is shown in the header
+# when a view is opened, so nothing is lost. Views not listed here fall back to a group chosen from their
+# database and kind, under their engine title.
+GROUPS = [  # id, heading, open when the window opens
+    ("notifications", "Notifications", True),
+    ("messages", "Text messages (SMS, MMS, chat)", False),
+    ("calls", "Calls", False),
+    ("contacts", "Contacts", False),
+    ("photos", "Photos", False),
+    ("apps", "Apps", False),
+    ("browser", "Browser, handoff and settings", False),
+    ("overview", "Overview and checks", False),
+    ("linked", "Phones linked to this PC", False),
+    ("conn", "USB and Bluetooth on this PC", False),
+    ("advanced", "Advanced", False),
+]
+SUBGROUPS = {  # sub-heading inside a group; folded away until opened
+    "together": "Rows that belong together",
+    "links": "Links to other tables",
+    "inferred": "Matched from other files (inferred)",
+    "between": "How these connect",
+    "maps": "SQLECmd map output",
+    "hashes": "Copies and hashes",
+}
+NAV = {  # view -> (group, sub-heading or None, name in the list)
+    # notifications.db
+    "N_notifications": ("notifications", None, "All notifications (live and deleted)"),
+    "N_messages": ("notifications", None, "Chat messages inside notifications"),
+    "N_actions": ("notifications", None, "Buttons on notifications"),
+    "N_toasts": ("notifications", None, "Windows pop-ups (toasts)"),
+    "N_requests": ("notifications", None, "Requests sent from the phone"),
+    "NR1": ("notifications", "together", "Same notification group"),
+    "NR2": ("notifications", "together", "Same chat conversation"),
+    "NR3": ("notifications", "together", "Earlier versions of a notification"),
+    "NR5": ("notifications", "together", "Each notification and its messages"),
+    "NR6": ("notifications", "together", "Each notification and its buttons"),
+    "ND1": ("notifications", "links", "Notification \u2192 Windows pop-up"),
+    "ND2": ("notifications", "links", "Phone request \u2192 notification"),
+    "ND3": ("notifications", "links", "Deleted rows and their live copy"),
+    # phone.db
+    "E_threads": ("messages", None, "Conversations"),
+    "E_sms": ("messages", None, "Text messages (SMS)"),
+    "E_mms": ("messages", None, "Picture messages (MMS)"),
+    "E_rcs": ("messages", None, "Chat conversations (RCS)"),
+    "E_participants": ("messages", None, "People in conversations"),
+    "E_sims": ("messages", None, "SIM cards"),
+    "R03": ("messages", "links", "Conversation \u2192 its messages"),
+    "R04": ("messages", "links", "Conversation \u2192 its people"),
+    "R05": ("messages", "links", "Picture message \u2192 attachments"),
+    "R06": ("messages", "links", "Chat \u2192 messages and files"),
+    "R07": ("messages", "links", "Chat \u2192 matching SMS conversation"),
+    "R08": ("messages", "links", "Pinned, muted or hidden conversations"),
+    "R09": ("messages", "links", "Messages waiting to be sent"),
+    "R10": ("messages", "links", "Text message \u2192 SIM card"),
+    "R15": ("messages", "inferred", "Text message \u2192 contact"),
+    "R16": ("messages", "inferred", "Conversation \u2192 contacts"),
+    "R17": ("messages", "inferred", "Person in a conversation \u2192 contact"),
+    # calling.db
+    "E_calls": ("calls", None, "All calls"),
+    "R13": ("calls", "inferred", "Call \u2192 contact"),
+    "R14": ("calls", "inferred", "Call \u2192 SIM card"),
+    # contacts.db
+    "E_contacts": ("contacts", None, "All contacts"),
+    "R01": ("contacts", "links", "Contact \u2192 numbers, emails and addresses"),
+    "R02": ("contacts", "links", "Deleted contact details"),
+    # photos.db
+    "E_photos": ("photos", None, "All photos"),
+    "R20": ("photos", "inferred", "Photos taken during a call"),
+    # phoneapps.db
+    "E_apps": ("apps", None, "Apps on the phone"),
+    "E_recent": ("apps", None, "Recently used apps"),
+    "E_pcapp": ("apps", None, "Matching apps on this PC"),
+    "R11": ("apps", "links", "App \u2192 recent use and PC match"),
+    "R19": ("apps", "inferred", "Notification, setting or web page \u2192 app"),
+    # continuity.db, settings.db
+    "E_browser": ("browser", None, "Web pages opened on the phone"),
+    "E_handoff": ("browser", None, "Apps continued on the PC (handoff)"),
+    "E_settings": ("browser", None, "Phone Link settings"),
+    # across the whole phone
+    "R22": ("overview", None, "Timeline \u2013 everything in time order"),
+    "R18": ("overview", None, "People \u2013 calls and texts per person"),
+    "R21": ("overview", None, "Things that happened close together"),
+    "R24": ("overview", None, "Unknown numbers and quiet contacts"),
+    "R23": ("overview", None, "Check: rows whose partner is missing"),
+    "R25": ("overview", None, "Check: is every feed fully synced?"),
+    "NR4": ("overview", None, "Check: notification columns vs stored data"),
+    # this PC: linked phones
+    "PC_devices": ("linked", None, "Phone pairings"),
+    "PC_phones": ("linked", None, "Phone details (make, model, Android)"),
+    "PC_trust": ("linked", None, "Trusted connections"),
+    "PC_streamed": ("linked", None, "Apps streamed to this PC"),
+    "PR4": ("linked", None, "Pairing history"),
+    "PR1": ("linked", "between", "Phone \u2192 trusted connection"),
+    "PR2": ("linked", "between", "Pairing \u2192 streamed apps"),
+    "PR3": ("linked", "between", "Phone \u2192 pairing (matched by time)"),
+    # this PC: cable and Bluetooth
+    "C_phones": ("conn", None, "Phones connected (summary)"),
+    "C_usb": ("conn", None, "USB devices"),
+    "C_wpd": ("conn", None, "Phones and cameras (MTP)"),
+    "C_bt": ("conn", None, "Bluetooth devices"),
+    "C_btsvc": ("conn", None, "Bluetooth services"),
+    "C_btle": ("conn", None, "Bluetooth Low Energy devices"),
+    "C_autoplay": ("conn", None, "AutoPlay devices"),
+    "C_install": ("conn", None, "First time connected (driver install)"),
+    "C_events": ("conn", None, "Connection events"),
+    "CR1": ("conn", None, "Same device seen in several places"),
+    # advanced
+    "P_copies": ("advanced", "hashes", "Evidence copies and hashes"),
+    "PC_copies": ("advanced", "hashes", "Linked-phone copies and hashes"),
+}
+MAP_NAMES = {  # SQLECmd map BaseFileName -> name in the list
+    "CallingDB_CallHistory": "Calls", "ContactsDB": "Contacts", "PhotosDB": "Photos",
+    "PhotosDB_Thumbnails": "Photo thumbnails", "PhotosDB_MediaBlobs": "Photo data",
+    "PhoneDB_SMSMessages": "Text messages", "PhoneDB_SubscriptionInfo": "SIM cards",
+    "NotificationsDB": "Notifications", "PhoneAppsDB_InstalledApps": "Installed apps",
+    "PhoneAppsDB_RecentApps": "Recent apps", "PhoneAppsDB_PCAppData": "Matching PC apps",
+    "ContinuityDB_BrowserHistory": "Browser history", "ContinuityDB_ContinueAppContext": "Handoff",
+    "DeviceDataDB_Wallpaper": "Wallpaper", "SettingsDB": "Settings",
+}
+GROUP_SHORT = {"messages": "Messages", "browser": "Browser", "overview": "Overview", "linked": "Linked phones",
+               "conn": "USB / Bluetooth"}   # for the narrow "Found in" column
+DB_GROUP = {"notifications.db": "notifications", "phone.db": "messages", "calling.db": "calls",
+            "contacts.db": "contacts", "photos.db": "photos", "phoneapps.db": "apps",
+            "continuity.db": "browser", "settings.db": "browser", "deviceData.db": "browser"}
+KIND_SUB = {"in-table": "together", "in-db": "links", "cross": "inferred"}
+BADGE = {"table": "DATA", "in-table": "ROWS THAT BELONG TOGETHER", "in-db": "LINKED TABLES",
+         "cross": "INFERRED MATCH", "check": "CHECK", "map": "SQLECMD MAP", "provenance": "HASHES",
+         "pc": "THIS PC", "conn": "THIS PC"}
+
+
+def nav_place(v, window_min=None):
+    """(group, sub-heading, name) for a view - its plain-English place in the view list."""
+    if v.vid in NAV:
+        group, sub, name = NAV[v.vid]
+        if v.vid == "R21" and window_min:
+            name = f"Things within {window_min} min of each other"
+        return group, sub, name
+    if v.kind == "map":
+        base = v.vid[2:]
+        return "advanced", "maps", MAP_NAMES.get(base, base.replace("_", " "))
+    name = re.sub(r"^[A-Z]{1,3}\d+\s+", "", v.title)
+    if v.kind == "provenance":
+        return "advanced", "hashes", name
+    if v.kind in ("pc", "conn"):
+        return {"pc": "linked", "conn": "conn"}[v.kind], None, name
+    if v.kind == "check":
+        return "overview", None, "Check: " + name
+    group = DB_GROUP.get(v.db or "", "overview")
+    return group, KIND_SUB.get(v.kind) if group != "overview" else None, name
+
+
 SCOPE_WORDS = {"in-table": "same table", "in-db": "other table, same database", "check": "check",
                "cross": "other database (inferred)"}
 WIDE = {"Title", "Text", "BigText", "BigTitle", "SubText", "TickerText", "Message", "Body", "Row", "Notification",
@@ -115,7 +268,7 @@ class Viewer(tk.Tk):
                   padx=10).pack(side="right", padx=8)
         tk.Button(bar, text="Open folder...", command=self.open_folder, relief="flat", bg="#1e3a56", fg="white",
                   padx=10).pack(side="right", padx=4)
-        tk.Checkbutton(bar, text="Show cross-database links", variable=self.show_cross, command=self.fill_nav,
+        tk.Checkbutton(bar, text="Show inferred matches", variable=self.show_cross, command=self.fill_nav,
                        bg=PANEL, fg="#9fb3c8", selectcolor=PANEL, activebackground=PANEL).pack(side="right", padx=12)
         tk.Label(bar, text="Nearby (min):", bg=PANEL, fg="#9fb3c8").pack(side="right", padx=(12, 2))
         sp = tk.Spinbox(bar, from_=1, to=1440, width=5, textvariable=self.window_min, command=self.rebuild)
@@ -131,15 +284,24 @@ class Viewer(tk.Tk):
         body = tk.PanedWindow(self, orient="horizontal", sashwidth=4, bg=BG)
         body.pack(fill="both", expand=True)
         left = tk.Frame(body, bg="white")
-        body.add(left, minsize=260, width=400)
-        tk.Label(left, text="VIEWS", bg="white", fg=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12,
-                                                                                            pady=(10, 2))
-        self.nav = ttk.Treeview(left, show="tree", style="Nav.Treeview", selectmode="browse")
-        self.nav.pack(fill="both", expand=True, padx=6, pady=6)
+        body.add(left, minsize=260, width=430)
+        tk.Label(left, text="CONTENTS", bg="white", fg=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12,
+                                                                                               pady=(10, 2))
+        navbox = tk.Frame(left, bg="white")
+        navbox.pack(fill="both", expand=True, padx=6, pady=6)
+        self.nav = ttk.Treeview(navbox, columns=("rows",), show="tree", style="Nav.Treeview", selectmode="browse")
+        self.nav.column("#0", width=300, stretch=True)
+        self.nav.column("rows", width=64, anchor="e", stretch=False)   # row count, right-aligned
+        nav_scroll = ttk.Scrollbar(navbox, orient="vertical", command=self.nav.yview)
+        self.nav.configure(yscrollcommand=nav_scroll.set)
+        nav_scroll.pack(side="right", fill="y")
+        self.nav.pack(side="left", fill="both", expand=True)
         self.nav.bind("<<TreeviewSelect>>", self.on_nav)
-        for k, (_, colour, _) in KIND.items():
-            self.nav.tag_configure(k, foreground=colour)
-        self.nav.tag_configure("db", foreground=INK, font=("Segoe UI", 9, "bold"))
+        self.nav.tag_configure("group", foreground=INK, font=("Segoe UI", 10, "bold"))
+        self.nav.tag_configure("sub", foreground=MUTED, font=("Segoe UI", 9, "italic"))
+        self.nav.tag_configure("item", foreground=INK)
+        self.nav.tag_configure("inferred", foreground=KIND["cross"][1])
+        self.nav.tag_configure("empty", foreground="#a0aebd")   # a view with no rows
 
         right = tk.PanedWindow(body, orient="vertical", sashwidth=4, bg=BG)
         body.add(right)
@@ -153,7 +315,8 @@ class Viewer(tk.Tk):
         self.kind_lbl.pack(side="left", padx=10)
         tk.Label(head, text="Filter:", bg=BG, fg=MUTED).pack(side="left", padx=(20, 4))
         self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *a: self.populate())
+        self._quiet = False      # True while show() clears the filter itself, so the table is filled once
+        self.filter_var.trace_add("write", lambda *a: None if self._quiet else self.populate())
         tk.Entry(head, textvariable=self.filter_var, width=30).pack(side="left")
         self.count_lbl = tk.Label(head, text="", bg=BG, fg=MUTED)
         self.count_lbl.pack(side="left", padx=10)
@@ -186,13 +349,17 @@ class Viewer(tk.Tk):
         tk.Label(lframe, text="LINKED ROWS  (double-click to jump)", bg=BG, fg=MUTED,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6)
         self.links = ttk.Treeview(lframe, columns=("how", "target", "where", "scope"), show="headings", height=8)
-        for c, w, t in (("how", 460, "How it is linked"), ("target", 340, "Linked row"), ("where", 260, "Its table"),
-                        ("scope", 170, "Where")):
+        for c, w, t in (("target", 280, "Linked row"), ("where", 300, "Found in"), ("how", 380, "How it is linked"),
+                        ("scope", 170, "Scope")):
             self.links.heading(c, text=t)
             self.links.column(c, width=w, minwidth=80, anchor="w", stretch=False)
+        self.links["displaycolumns"] = ("target", "where", "how", "scope")   # what it is and where, first
         for k, (_, colour, _) in KIND.items():
             self.links.tag_configure(k, foreground=colour)
-        self.links.pack(fill="both", expand=True, padx=6, pady=(2, 8))
+        links_x = ttk.Scrollbar(lframe, orient="horizontal", command=self.links.xview)
+        self.links.configure(xscrollcommand=links_x.set)
+        links_x.pack(side="bottom", fill="x", padx=6)
+        self.links.pack(fill="both", expand=True, padx=6, pady=(2, 4))
         self.links.bind("<Double-1>", self.on_jump)
         self.link_targets = {}
 
@@ -266,45 +433,57 @@ class Viewer(tk.Tk):
             self.leftovers.append(leftover)
 
     def fill_nav(self):
+        """The view list: topic groups in plain English, row counts on the right, sub-headings folded away."""
+        opened = {i for i in self._all_nav_ids() if self.nav.item(i, "open")} if self.nav.get_children() else None
         self.nav.delete(*self.nav.get_children())
-        order = {"table": 0, "in-table": 1, "in-db": 2}
-        built = {vid: i for i, vid in enumerate(self.g.views)}  # keep the order the engine built them in
         shown = [v for v in self.g.views.values() if v.kind != "cross" or self.show_cross.get()]
-        for kind in ("pc", "conn"):
-            views = [v for v in shown if v.kind == kind]
-            if kind == "conn":
-                views.sort(key=lambda v: v.vid != "C_phones")  # the summary first
-            if views:
-                node = self.nav.insert("", "end", iid=f"sec:{kind}", text=KIND[kind][0], open=True, tags=("db",))
-                for v in views:
-                    self.nav.insert(node, "end", iid=v.vid, text=f"{v.title}  ({len(v.rows):,})", tags=(kind,))
-        for db in R.P.DB_NAMES:
-            views = sorted((v for v in shown if v.db == db and v.kind in order),
-                           key=lambda v: (order[v.kind], built[v.vid]))
+        places = {v.vid: nav_place(v, self.window_min.get()) for v in shown}
+        rank = {vid: i for i, vid in enumerate(NAV)}
+        built = {vid: i for i, vid in enumerate(self.g.views)}
+        for gid, heading, open_default in GROUPS:
+            views = [v for v in shown if places[v.vid][0] == gid]
             if not views:
                 continue
-            node = self.nav.insert("", "end", iid=f"db:{db}", text=db, open=(db == "notifications.db"), tags=("db",))
-            last = None
+            views.sort(key=lambda v: (rank.get(v.vid, len(rank)), built[v.vid]))   # NAV order, then build order
+            node = f"grp:{gid}"
+            self.nav.insert("", "end", iid=node, text=heading, values=("",), tags=("group",),
+                            open=open_default if opened is None else node in opened)
+            data, subs = [], {}
             for v in views:
-                if v.kind != last and v.kind != "table":
-                    self.nav.insert(node, "end", iid=f"sec:{db}:{v.kind}", text="   " + KIND[v.kind][0].upper(),
-                                    tags=(v.kind,))
-                last = v.kind
-                self.nav.insert(node, "end", iid=v.vid, text=f"{v.title}  ({len(v.rows):,})", tags=(v.kind,))
-        for kind in ("check", "cross", "map", "provenance"):
-            views = [v for v in shown if v.kind == kind]
-            if views:
-                node = self.nav.insert("", "end", iid=f"sec:{kind}", text=KIND[kind][0], open=False, tags=(kind,))
-                for v in views:
-                    self.nav.insert(node, "end", iid=v.vid, text=f"{v.title}  ({len(v.rows):,})", tags=(v.kind,))
+                sub = places[v.vid][1]
+                (subs.setdefault(sub, []) if sub else data).append(v)
+            for v in data:     # the data first, then the folded sub-headings
+                self._nav_item(node, v, places)
+            for sub, members in sorted(subs.items(), key=lambda kv: list(SUBGROUPS).index(kv[0])
+                                       if kv[0] in SUBGROUPS else len(SUBGROUPS)):
+                sid = f"sub:{gid}:{sub}"
+                self.nav.insert(node, "end", iid=sid, text=SUBGROUPS.get(sub, sub), values=("",), tags=("sub",),
+                                open=False if opened is None else sid in opened)
+                for v in members:
+                    self._nav_item(sid, v, places)
         if self.cur_vid in self.g.views and self.nav.exists(self.cur_vid):
-            self.nav.selection_set(self.cur_vid)
             self.nav.see(self.cur_vid)
+            self.nav.selection_set(self.cur_vid)
+
+    def _nav_item(self, parent, v, places):
+        tags = ("empty",) if not v.rows else ("inferred",) if v.kind == "cross" else ("item",)
+        self.nav.insert(parent, "end", iid=v.vid, text=places[v.vid][2], values=(f"{len(v.rows):,}",), tags=tags)
+
+    def _all_nav_ids(self, parent=""):
+        out = []
+        for i in self.nav.get_children(parent):
+            out += [i] + self._all_nav_ids(i)
+        return out
+
+    def friendly(self, vid):
+        """'Group > name' for a view, as the view list shows it."""
+        gid, _, name = nav_place(self.g.views[vid], self.window_min.get())
+        return f"{GROUP_SHORT.get(gid) or dict((g, h) for g, h, _ in GROUPS).get(gid, gid)} \u203a {name}"
 
     # ------------------------------------------------------------ views
     def on_nav(self, _=None):
         sel = self.nav.selection()
-        if sel and not sel[0].startswith(("sec:", "db:")) and sel[0] != self.cur_vid:
+        if sel and not sel[0].startswith(("grp:", "sub:")) and sel[0] != self.cur_vid:
             self.show(sel[0], from_nav=True)
 
     def show(self, vid, from_nav=False, select_index=None):
@@ -316,17 +495,22 @@ class Viewer(tk.Tk):
             self.nav.selection_set(vid)
             self.nav.see(vid)
         name, colour, meaning = KIND[v.kind]
-        self.title_lbl.config(text=v.title)
-        self.kind_lbl.config(text=v.kind.upper(), bg=colour)
+        self.title_lbl.config(text=nav_place(v, self.window_min.get())[2])
+        self.kind_lbl.config(text=BADGE.get(v.kind, v.kind.upper()), bg=colour)
         where = f"{v.db}  -  " if v.db else ""
-        self.basis_lbl.config(text=f"{where}{meaning}.   Source: {v.basis}.", fg=colour)
+        self.basis_lbl.config(text=f"{where}{meaning}.   Source: {v.basis}.   Technical name: {v.vid} \u2013 "
+                                   f"{v.title}", fg=colour)
         self.table["columns"] = v.cols
         for c in v.cols:
             self.table.heading(c, text=c, command=lambda c=c: self.sort_by(c))
             self.table.column(c, width=260 if c in WIDE else max(80, min(220, 9 * len(c) + 40)), anchor="w",
                               stretch=False)
-        if select_index is not None:
-            self.filter_var.set("")
+        if select_index is not None and self.filter_var.get():
+            self._quiet = True
+            try:
+                self.filter_var.set("")
+            finally:
+                self._quiet = False
         self.populate(select_index)
 
     def populate(self, select_index=None):
@@ -351,17 +535,27 @@ class Viewer(tk.Tk):
             self.table.focus(str(select_index))
 
     def sort_by(self, col):
+        # sort the row list and refill: moving 30,000 Tk items one by one took about 6 s, and keeping
+        # cur_rows in display order makes Export write what the screen shows
         rev = self.sort_state.get(col, False)
-        items = [(self.table.set(k, col), k) for k in self.table.get_children("")]
+        v = self.g.views[self.cur_vid]
 
-        def key(x):
+        def key(i):
+            x = v.rows[i].get(col)
+            x = "" if x is None else str(x)
             try:
-                return (0, float(x[0]))
+                return (0, float(x))
             except ValueError:
-                return (1, x[0].lower())
-        items.sort(key=key, reverse=rev)
-        for n, (_, k) in enumerate(items):
-            self.table.move(k, "", n)
+                return (1, x.lower())
+        self.cur_rows.sort(key=key, reverse=rev)
+        sel = self.table.selection()
+        self.table.delete(*self.table.get_children())
+        for i in self.cur_rows:
+            r = v.rows[i]
+            self.table.insert("", "end", iid=str(i), values=["" if r.get(c) is None else str(r.get(c)) for c in v.cols])
+        if sel:
+            self.table.selection_set(sel)
+            self.table.see(sel[0])
         self.sort_state[col] = not rev
 
     # ------------------------------------------------------------ links
@@ -414,10 +608,10 @@ class Viewer(tk.Tk):
                 where = ""
                 if home:
                     hv = self.g.views[home[0]]
-                    where = f"{hv.db or ''} / {hv.title}"
+                    where = self.friendly(home[0])
                 iid = f"l{n}"
                 self.links.insert("", "end", iid=iid, tags=(scope,),
-                                  values=(note or (rv.title if rv else rid), self.g.label.get(target, str(target)),
+                                  values=(note or (nav_place(rv)[2] if rv else rid), self.g.label.get(target, str(target)),
                                           where, SCOPE_WORDS.get(scope, scope)))
                 self.link_targets[iid] = target
                 n += 1

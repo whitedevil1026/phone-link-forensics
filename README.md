@@ -35,6 +35,8 @@ All screenshots and test data in this repository are **synthetic** (example name
 
 ## Screenshots
 
+The **Contents** list on the left uses plain names grouped by topic, with each view's row count on the right. Every screenshot uses the synthetic demo data.
+
 **Linked phones**: every phone ever linked to this PC through Phone Link, including pairings whose data was removed. The panel on the right shows how a pairing connects to its phone details and streamed apps.
 
 ![Linked phones](docs/images/01-linked-phones.png)
@@ -43,7 +45,7 @@ All screenshots and test data in this repository are **synthetic** (example name
 
 ![Notifications](docs/images/02-notifications.png)
 
-**A relation inside one table**: the same Android notification in several versions. Here a deleted row is the earlier version of a live one.
+**Rows that belong together**: *Earlier versions of a notification*. Here a deleted row is the earlier version of a live one.
 
 ![Notification versions](docs/images/03-notification-versions.png)
 
@@ -59,7 +61,7 @@ All screenshots and test data in this repository are **synthetic** (example name
 
 ![Connection events](docs/images/08-connection-events.png)
 
-**Relations between tables of one database**: SMS thread -> participants in `phone.db`.
+**Links to other tables**: *Conversation → its people*, under Text messages (joined inside `phone.db`).
 
 ![phone.db relations](docs/images/07-phone-db-relations.png)
 
@@ -111,16 +113,18 @@ That folder holds `phone.db` (SMS, MMS, RCS), `calling.db` (calls), `contacts.db
 
 ### The window
 
-- **Left: the views,** grouped as:
-  - **Linked phones (this PC)**
-  - **Phone connections – USB cable and Bluetooth (this PC)**
-  - **one node per database**, holding its tables, relations *inside one table* and relations *between tables of that database*
-  - **Checks**, **SQLECmd map output** and **Provenance** (copies and hashes)
+- **Left: Contents.** Plain-English names grouped by topic, each with its row count on the right:
+  - **Notifications** (open when the window starts), **Text messages (SMS, MMS, chat)**, **Calls**, **Contacts**, **Photos**, **Apps**, **Browser, handoff and settings**
+  - **Overview and checks**: the timeline, calls and texts per person, and the checks
+  - **Phones linked to this PC** and **USB and Bluetooth on this PC**
+  - **Advanced**: the SQLECmd map output, and the copies with their hashes
+  - Inside a topic the data comes first. **Rows that belong together**, **Links to other tables** and **Matched from other files (inferred)** are folded sub-headings. A greyed name has no rows.
+  - Opening a view puts its technical name (view code, database and table) in the banner, so nothing technical is hidden.
 - **Middle: the table.** Sortable columns and a filter box. The banner above it says what the view is and where its data comes from.
 - **Bottom left: the selected row**, all fields. For a notification the raw JSON is shown underneath.
-- **Bottom right: linked rows.** Each line says *how* the row is linked (in plain words), *which* row, *which table* it lives in, and whether it's in the same table, another table of the same database, or another database. **Double-click a line to jump to that row.**
+- **Bottom right: linked rows.** Each line shows *which* row is linked, *where* it is found (topic › view), *how* it is linked (in plain words), and whether it's in the same table, another table of the same database, or another database. **Double-click a line to jump to that row.**
 - **Top bar:**
-  - **Show cross-database links**: off by default, because those links are the tool's inferences.
+  - **Show inferred matches**: off by default, because matches across database files are the tool's inferences.
   - **Nearby (min)**: the window used for "events close in time".
   - **Open folder…** and **Export view (CSV)**.
 

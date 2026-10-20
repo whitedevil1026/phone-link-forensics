@@ -22,6 +22,7 @@ Usage as a library:
     graph.views["R13"].rows                      # one relation as a table
     graph.links(("call", 42))                    # every link of one row
 """
+import bisect
 import os
 import re
 import shutil
@@ -165,6 +166,7 @@ class Graph:
         self.label = {}          # entity -> short text
         self.time = {}           # entity -> unix seconds
         self.edges = defaultdict(list)  # entity -> [(rid, other entity, note)]
+        self._edge_set = set()   # (entity, rid, other, note) - O(1) duplicate check; a list scan was quadratic
         self.relations = []      # relation vids in display order
 
     def add_view(self, v, entity_col=None):
@@ -178,10 +180,11 @@ class Graph:
     def link(self, rid, a, b, note=""):
         if a is None or b is None or a == b:
             return
-        if (rid, b, note) not in self.edges[a]:
-            self.edges[a].append((rid, b, note))
-        if (rid, a, note) not in self.edges[b]:
-            self.edges[b].append((rid, a, note))
+        for x, y in ((a, b), (b, a)):
+            k = (x, rid, y, note)
+            if k not in self._edge_set:
+                self._edge_set.add(k)
+                self.edges[x].append((rid, y, note))
 
     def links(self, entity):
         return self.edges.get(entity, [])
@@ -647,12 +650,18 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
     # R20 photo taken during a call
     timed_calls = [(g.time[c["_e"]], g.time[c["_e"]] + int(c["_dur"] or 0), c) for c in call_rows
                    if g.time.get(c["_e"]) and int(c["_dur"] or 0) > 0]
+    # sorted by start + bisect instead of photos x calls; candidates are put back in call order so the
+    # output is the same as the plain double loop
+    by_start = sorted(range(len(timed_calls)), key=lambda i: timed_calls[i][0])
+    starts = [timed_calls[i][0] for i in by_start]
+    longest = max((e_ - s for s, e_, _ in timed_calls), default=0)
     rows = []
     for p in photo_rows:
         t = g.time.get(p["_e"])
         if t is None:
             continue
-        for s, e_, c in timed_calls:
+        lo, hi = bisect.bisect_left(starts, t - longest), bisect.bisect_right(starts, t)
+        for s, e_, c in (timed_calls[i] for i in sorted(by_start[lo:hi])):
             if s <= t <= e_:
                 g.link("R20", p["_e"], c["_e"], "photo taken during the call")
                 rows.append({"MediaID": p["MediaID"], "Photo": p["Name"], "TakenUTC": p["TakenUTC"],
