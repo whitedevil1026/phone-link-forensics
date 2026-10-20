@@ -126,5 +126,34 @@ class DatabaseFirstTest(unittest.TestCase):
         self.app.on_jump()
         self.assertEqual(self.app.cur_vid, "N_toasts")
 
+
+class LinkedPhonesViewTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = pldemo.build_package(self.tmp.name)
+        self.app = V.Viewer(V.P.find_device_dirs(root), localcache=V.D.find_localcache(root))
+        self.app.withdraw()
+        self.app.update()
+
+    def tearDown(self):
+        pc_work = self.app.pc.work
+        self.app.on_close()
+        self.assertFalse(os.path.exists(pc_work))
+        self.tmp.cleanup()
+
+    def test_linked_phones_section_and_links(self):
+        self.assertIn("PC_devices", self.app.nav.get_children("sec:pc"))
+        rows = self.app.g.views["PC_devices"].rows
+        idx = next(i for i, r in enumerate(rows) if r["Status"] == "data present")
+        self.app.show("PC_devices", select_index=idx)
+        self.app.on_row()
+        kinds = {t[0] for t in self.app.link_targets.values()}
+        self.assertEqual(kinds, {"streamed", "phone"})
+        target = next(i for i, t in self.app.link_targets.items() if t[0] == "phone")
+        self.app.links.selection_set(target)
+        self.app.on_jump()
+        self.assertEqual(self.app.cur_vid, "PC_phones")
+
+
 if __name__ == "__main__":
     unittest.main()

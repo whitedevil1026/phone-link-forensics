@@ -18,5 +18,7 @@ jobs:
         run: python tests/run_tests.py --upstream-maps upstream/SQLMap/Maps
       - name: Viewer relation tests
         run: python viewer/test_plrelate.py
+      - name: Linked-phones tests
+        run: python viewer/test_pldevices.py
       - name: Viewer GUI tests (virtual display)
         run: xvfb-run -a python viewer/test_plmapview.py

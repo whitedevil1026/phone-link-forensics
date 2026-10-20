@@ -91,6 +91,18 @@ python viewer/plmapview.py --input "%LOCALAPPDATA%\Packages\Microsoft.YourPhone_
 
 Select a row and the panel lists every linked row. It says in plain words how each one is linked and which table it is in; double-click a link to jump to it. Links **between different databases** (for example a call matched to a contact by number) are inferences, hidden until you tick *Show cross-database links*.
 
+**Linked phones (this PC):** every phone that has ever been linked to this PC, even ones whose data Phone Link has since removed. Open the package folder (`...\Packages\Microsoft.YourPhone_8wekyb3d8bbwe`) to see it.
+
+| View | Source | What it shows |
+|---|---|---|
+| Phone pairings | `LocalCache\Indexed\<GUID>\` | One row per pairing, oldest first. The folder's creation time is when that phone was linked. Status: data present / databases present but empty / folder only (data removed). Databases left, row counts, first/last activity, SIM, apps streamed |
+| Phone details | `DeviceMetadataStorage.json` | Per hardware ID: display name, manufacturer, model, Android version, Phone Link app version, capabilities, linked/enabled, registration and last-seen times. A hardware ID with no details is a phone that was unlinked |
+| Trust relationships | `YppCryptoTrustRelationships` | Partner device, trust type, last access, key expiry, Microsoft account ID (MsaCid) |
+| Apps streamed per device | `Indexed\FullTrust\phone_apps.db` | `hosted_app_ids`, one row per app a phone streamed to the PC |
+| Links | | Phone details -> trust relationship (**stored**: the partner ID is `<prefix>_<metadata Id>`); pairing folder -> streamed apps (**stored**: `device_id` is the folder name); phone details -> pairing folder (**inferred by time**: the closest folder created within 10 minutes after registration); one pairing history in time order |
+
+`PlatformEncryptedKeyStorage.json` (encryption keys) is never copied, and certificate bodies are never shown, only counted. The package files are copied and hash-verified like the databases.
+
 **notifications.db (first database done):**
 - **Rows:** live rows plus rows carved from free pages (Source = deleted, with page and offset).
 - **JSON:** every field becomes a column. `flags`, `importance`, `priority` and the Android `key` are decoded as the Android API defines them.
@@ -106,6 +118,7 @@ The other databases already have relations between their tables (contacts, SMS t
 | `viewer/plmapview.py` | The viewer |
 | `viewer/plrelate.py` | Relation engine: copies and hashes, entities, links, relation tables, SQLECmd map output |
 | `viewer/plnotif.py` | notifications.db: live and carved rows, json unpacked and decoded, its relations |
+| `viewer/pldevices.py` | Linked phones: every pairing folder, phone details, trust relationships, streamed apps |
 | `viewer/plparse.py`, `viewer/plcarve.py` | Copy-first staging, address normalisation and time conversion; schema-guided SQLite carver |
 | `viewer/pldemo.py` | A synthetic device folder with known relations, including deleted notifications on free pages |
 | `viewer/maps-upstream/` | The four stock SQLECmd Phone Link maps, unchanged (authors in each file), so the viewer can show their output too |
@@ -121,7 +134,8 @@ python tests/run_tests.py                                         # emulator, sy
 python tests/run_tests.py --sqlecmd C:\Tools\SQLECmd.exe           # plus the real SQLECmd
 python tests/stress.py C:\Tools\SQLECmd.exe                        # large synthetic databases
 python viewer/test_plrelate.py                                     # viewer: 32 relation tests, planted answers
-python viewer/test_plmapview.py                                    # viewer: 7 GUI tests
+python viewer/test_plmapview.py                                    # viewer: 8 GUI tests
+python viewer/test_pldevices.py                                    # viewer: 9 linked-phones tests
 ```
 
 ## Related

@@ -135,11 +135,15 @@ class Evidence:
         return self.con(db).execute(f'SELECT count(*) FROM "{table}"').fetchone()[0] if self.has(db, table) else None
 
     def close(self, remove=True):
+        """Close and remove the copies. Returns the folder if it could not be removed, so callers can warn."""
         for c in self._con.values():
             c.close()
         self._con.clear()
         if remove:
             shutil.rmtree(self.work, ignore_errors=True)
+            if os.path.exists(self.work):
+                return self.work
+        return None
 
 
 # ---------------------------------------------------------------- graph

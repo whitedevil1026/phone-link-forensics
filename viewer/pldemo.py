@@ -329,6 +329,62 @@ def build(folder):
     return folder
 
 
+PAIRING_GUIDS = ["e1e1e1e1-e1e1-4e1e-ae1e-e1e1e1e1e1e1",   # oldest, folder only
+                 "e2e2e2e2-e2e2-4e2e-ae2e-e2e2e2e2e2e2",   # databases left but empty
+                 "e3e3e3e3-e3e3-4e3e-ae3e-e3e3e3e3e3e3"]   # the current phone, full demo data
+DEMO_PHONE_ID = "demo-metadata-id-0001"
+
+
+def build_package(root):
+    """A synthetic Phone Link package: three pairings, metadata, trust file, a key file that must NOT be copied."""
+    import time
+    lc = os.path.join(root, "Microsoft.YourPhone_8wekyb3d8bbwe", "LocalCache")
+    idx = os.path.join(lc, "Indexed")
+    os.makedirs(os.path.join(idx, PAIRING_GUIDS[0]), exist_ok=True)
+    empty = os.path.join(idx, PAIRING_GUIDS[1], "System", "Database")
+    os.makedirs(empty, exist_ok=True)
+    con = sqlite3.connect(os.path.join(empty, "settings.db"))
+    for s in DDL["settings.db"]:
+        con.execute(s)
+    con.commit()
+    con.close()
+    time.sleep(1.2)                                           # the older pairings exist before this phone registers
+    reg = datetime.utcnow()
+    time.sleep(0.3)
+    build(os.path.join(idx, PAIRING_GUIDS[2], "System", "Database"))   # current pairing folder appears just after
+    ft = os.path.join(idx, "FullTrust")
+    os.makedirs(ft, exist_ok=True)
+    con = sqlite3.connect(os.path.join(ft, "phone_apps.db"))
+    con.execute("CREATE TABLE hosted_app_ids (row_id INTEGER PRIMARY KEY, package_id TEXT, last_window_position TEXT,"
+                " last_notification_count INTEGER, last_volume_level INTEGER, last_is_muted_state INTEGER,"
+                " last_screen_mode INTEGER, last_window_position_in_expanded_layout TEXT, device_id TEXT)")
+    con.executemany("INSERT INTO hosted_app_ids (package_id, last_notification_count, device_id) VALUES (?, ?, ?)",
+                    [("com.example.chat", 2, PAIRING_GUIDS[2]), ("com.example.maps", 0, PAIRING_GUIDS[2])])
+    con.commit()
+    con.close()
+    iso = reg.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    meta = {"ConfigVersion": 1, "DeviceMetadatas": {
+        "00000000EXAMPLE1": [],                                  # a phone whose details were removed
+        "00000000EXAMPLE2": [{"Certificates": {"SelfSigned": ["example-cert"]}, "IsLinked": True, "Metadata": {
+            "Id": DEMO_PHONE_ID, "DistinguishedDeviceId": "demo-distinguished-0001", "RegitrationTime": iso,
+            "LastSeenTime": iso, "Metadata": {
+                "ClientType": "Android", "ClientVersion": "1.0.example", "DisplayName": "Example Phone",
+                "OsName": "Android", "OsVersion": "99", "Capabilities": ["Messaging", "Photos"],
+                "Manufacture": "ExampleCorp", "ModelName": "EX-1", "ModelVersion": "1", "ConsentVersion": 1,
+                "IsEnabled": True, "CustomData": ""}}}]}}
+    with open(os.path.join(lc, "DeviceMetadataStorage.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+    trust = {"ConfigVersion": 1, "TrustedClients": {DEMO_PHONE_ID: {
+        "SelfClientId": "demo-self-0001", "PartnerClientId": "demox_" + DEMO_PHONE_ID, "PartnerCertificate": "example-cert",
+        "PartnerTemporaryCertificate": None, "PartnerKeyExpirationTime": iso, "RelationshipLastAccessTime": iso,
+        "Attributes": {"dcg_prod_client_id": "demo-dcg-0001"}, "MsaCid": "demo-msa-0001", "TrustType": 3}}}
+    with open(os.path.join(lc, "YppCryptoTrustRelationships"), "w", encoding="utf-8") as f:
+        json.dump(trust, f)
+    with open(os.path.join(lc, "PlatformEncryptedKeyStorage.json"), "w", encoding="utf-8") as f:
+        json.dump({"ConfigVersion": 1, "EncryptedKeys": {"f0f0f0f0-f0f0-4f0f-af0f-f0f0f0f0f0f0": "secret"}}, f)
+    return os.path.join(root, "Microsoft.YourPhone_8wekyb3d8bbwe")
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit(__doc__)
