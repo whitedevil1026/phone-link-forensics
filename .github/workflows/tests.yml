@@ -20,5 +20,7 @@ jobs:
         run: python viewer/test_plrelate.py
       - name: Linked-phones tests
         run: python viewer/test_pldevices.py
+      - name: Cable / Bluetooth connection tests
+        run: python viewer/test_plconnect.py
       - name: Viewer GUI tests (virtual display)
         run: xvfb-run -a python viewer/test_plmapview.py

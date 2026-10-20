@@ -26,12 +26,16 @@ except ImportError:  # pragma: no cover
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import plparse as P  # noqa: E402
+import plconnect as C  # noqa: E402
 import pldevices as D  # noqa: E402
 import plrelate as R  # noqa: E402
 
 BG, PANEL, INK, MUTED = "#f4f7fa", "#16293f", "#13233a", "#667c93"
 KIND = {  # kind -> (heading, colour, plain meaning)
     "pc": ("Linked phones (this PC)", "#5d4037", "Every phone ever linked to this PC, from the package-level files"),
+    "conn": ("Phone connections - USB cable and Bluetooth (this PC)", "#37474f",
+             "Read live, read-only, from THIS computer's registry, setup logs and event logs - not from the evidence "
+             "folder"),
     "table": ("Table", "#1e3a56", "Rows of one table"),
     "in-table": ("Inside one table", "#2e7d32", "Rows of the SAME table that belong together, or data packed inside a row"),
     "in-db": ("Between tables of one database", "#00897b", "Tables in the SAME database file joined by an ID column"),
@@ -62,11 +66,12 @@ def _dpi_aware():
 
 
 class Viewer(tk.Tk):
-    def __init__(self, devices, window_min=R.DEFAULT_WINDOW_MIN, initial=None, localcache=None):
+    def __init__(self, devices, window_min=R.DEFAULT_WINDOW_MIN, initial=None, localcache=None, connections=None):
         _dpi_aware()
         super().__init__()
         self.devices = devices
         self.localcache = localcache
+        self.connections = C.CachedSource(connections) if connections is not None else None
         self.pc = None
         self.leftovers = []
         self.window_min = tk.IntVar(value=window_min)
@@ -243,6 +248,12 @@ class Viewer(tk.Tk):
         except (OSError, ValueError) as e:
             self.g.add_view(R.View("PC_devices", "Phone pairings (device folders)", "pc", f"could not read: {e}",
                                    ["Error"], [{"Error": str(e)}]))
+        if self.connections is not None:
+            try:
+                C.build(self.connections, self.g, R.View)
+            except OSError as e:
+                self.g.add_view(R.View("C_phones", "Phone connections", "conn", f"could not read: {e}", ["Error"],
+                                       [{"Error": str(e)}]))
 
     def _remember(self, leftover):
         if leftover:
@@ -253,11 +264,14 @@ class Viewer(tk.Tk):
         order = {"table": 0, "in-table": 1, "in-db": 2}
         built = {vid: i for i, vid in enumerate(self.g.views)}  # keep the order the engine built them in
         shown = [v for v in self.g.views.values() if v.kind != "cross" or self.show_cross.get()]
-        pcs = [v for v in shown if v.kind == "pc"]
-        if pcs:
-            node = self.nav.insert("", "end", iid="sec:pc", text=KIND["pc"][0], open=True, tags=("db",))
-            for v in pcs:
-                self.nav.insert(node, "end", iid=v.vid, text=f"{v.title}  ({len(v.rows):,})", tags=("pc",))
+        for kind in ("pc", "conn"):
+            views = [v for v in shown if v.kind == kind]
+            if kind == "conn":
+                views.sort(key=lambda v: v.vid != "C_phones")  # the summary first
+            if views:
+                node = self.nav.insert("", "end", iid=f"sec:{kind}", text=KIND[kind][0], open=True, tags=("db",))
+                for v in views:
+                    self.nav.insert(node, "end", iid=v.vid, text=f"{v.title}  ({len(v.rows):,})", tags=(kind,))
         for db in R.P.DB_NAMES:
             views = sorted((v for v in shown if v.db == db and v.kind in order),
                            key=lambda v: (order[v.kind], built[v.vid]))
@@ -492,18 +506,25 @@ def main():
     ap.add_argument("--view", help="view to open first, for example R13 or E_calls")
     ap.add_argument("--select", type=int, help="row index to select in that view")
     ap.add_argument("--screenshot", help="save a PNG of the window and exit (needs Pillow)")
+    ap.add_argument("--this-pc", action="store_true",
+                    help="also show phones connected to THIS computer by USB cable or Bluetooth (live registry, logs "
+                         "and event logs, read-only). On by default when --input is this PC's own Phone Link folder")
     a = ap.parse_args()
     if a.demo:
         import pldemo
         root = pldemo.build_package(tempfile.mkdtemp(prefix="pldemo-"))
         devices = [(f"demo (synthetic) {lbl}", d) for lbl, d in P.find_device_dirs(root)]
         localcache = D.find_localcache(root)
+        connections = C.demo_source()
     else:
         devices = P.find_device_dirs(os.path.expandvars(a.input))
         if not devices:
             sys.exit(f"No Phone Link databases found under {a.input}")
         localcache = D.find_localcache(a.input)
-    app = Viewer(devices, a.window, a.view, localcache)
+        own = os.path.normcase(os.path.abspath(os.path.expandvars("%LOCALAPPDATA%")))
+        is_this_pc = os.path.normcase(os.path.abspath(os.path.expandvars(a.input))).startswith(own)
+        connections = C.LiveSource() if (a.this_pc or is_this_pc) and os.name == "nt" else None
+    app = Viewer(devices, a.window, a.view, localcache, connections)
     if a.select is not None:
         app.show(app.cur_vid, select_index=a.select)
         app.on_row()

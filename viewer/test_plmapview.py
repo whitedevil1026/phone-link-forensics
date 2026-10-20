@@ -155,5 +155,42 @@ class LinkedPhonesViewTest(unittest.TestCase):
         self.assertEqual(self.app.cur_vid, "PC_phones")
 
 
+
+class ConnectionsViewTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = pldemo.build_package(self.tmp.name)
+        self.app = V.Viewer(V.P.find_device_dirs(root), localcache=V.D.find_localcache(root),
+                            connections=V.C.demo_source())
+        self.app.withdraw()
+        self.app.update()
+
+    def tearDown(self):
+        self.app.on_close()
+        self.tmp.cleanup()
+
+    def test_connections_section_summary_first_and_links(self):
+        kids = self.app.nav.get_children("sec:conn")
+        self.assertEqual(kids[0], "C_phones")
+        rows = self.app.g.views["C_usb"].rows
+        idx = next(i for i, r in enumerate(rows) if r["PhoneEvidence"])
+        self.app.show("C_usb", select_index=idx)
+        self.app.on_row()
+        kinds = {t[0] for t in self.app.link_targets.values()}
+        self.assertTrue({"wpd", "autoplay", "install", "event"} <= kinds)
+        target = next(i for i, t in self.app.link_targets.items() if t[0] == "install")
+        self.app.links.selection_set(target)
+        self.app.on_jump()
+        self.assertEqual(self.app.cur_vid, "C_install")
+
+    def test_hidden_without_a_source(self):
+        app = V.Viewer(self.app.devices, localcache=self.app.localcache)
+        app.withdraw()
+        try:
+            self.assertFalse(app.nav.exists("sec:conn"))
+        finally:
+            app.on_close()
+
+
 if __name__ == "__main__":
     unittest.main()
