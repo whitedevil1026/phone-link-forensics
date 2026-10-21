@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -234,6 +235,362 @@ class ConnectionsViewTest(unittest.TestCase):
             self.assertFalse(app.nav.exists("grp:conn"))
         finally:
             app.on_close()
+
+
+
+def tkfont_measure(widget, text):
+    import tkinter.font as tkfont
+    return tkfont.Font(font=widget.cget("font")).measure(text)
+
+
+class WindowFixesTest(unittest.TestCase):
+    """The review fixes for the window: toolbar, cross toggle, nearby box, export, device switch."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = pldemo.build(os.path.join(self.tmp.name, "device"))
+        self.apps = []
+        self.app = self.make([("demo", self.src)])
+
+    def make(self, devices, withdraw=True, **kw):
+        app = V.Viewer(devices, **kw)
+        if withdraw:
+            app.withdraw()
+        app.update()
+        self.apps.append(app)
+        return app
+
+    def tearDown(self):
+        for a in self.apps:
+            try:
+                a.on_close(warn=False)
+            except Exception:
+                pass
+        self.tmp.cleanup()
+
+    # ---- 1 toolbar
+    def test_toolbar_controls_stay_usable_with_a_long_source_path(self):
+        d2 = pldemo.build(os.path.join(self.tmp.name, "device2"))
+        app = self.make([("a" * 10 + "p" * 140, self.src), ("second", d2)], withdraw=False)
+        app.geometry("1256x675")
+        app.update()
+        controls = {"device picker": app.dev_combo, "Nearby box": app.nearby_spin, "inferred tick": app.cross_chk,
+                    "Open folder": app.open_btn, "Export": app.export_btn}
+        for name, w in controls.items():
+            self.assertTrue(w.winfo_ismapped(), name)
+            self.assertGreaterEqual(w.winfo_width(), w.winfo_reqwidth(), name)
+
+    def test_long_source_line_is_shortened_in_the_middle_to_fit(self):
+        app = self.make([("a" * 10 + "p" * 140, self.src)], withdraw=False)
+        app.geometry("600x500")
+        app.update()
+        text = app.src_lbl.cget("text")
+        self.assertIn("…", text)
+        self.assertLess(len(text), 100)
+        self.assertTrue(text.startswith("aaaa") and text.endswith(self.src[-6:]))
+        self.assertLessEqual(tkfont_measure(app.src_lbl, text), app.src_lbl.winfo_width())
+
+    def test_elide_middle(self):
+        self.assertEqual(V.elide_middle("short", 20), "short")
+        out = V.elide_middle("a" * 50 + "TAIL", 21)
+        self.assertEqual(len(out), 21)
+        self.assertTrue(out.startswith("aaaa") and out.endswith("TAIL") and "…" in out)
+
+    # ---- 2 inferred toggle
+    def test_unticking_inferred_matches_leaves_an_inferred_view(self):
+        app = self.app
+        app.show_cross.set(True)
+        app.fill_nav()
+        app.show("R13")
+        self.assertEqual(app.g.views["R13"].kind, "cross")
+        app.show_cross.set(False)
+        app.on_cross_toggle()
+        self.assertNotEqual(app.g.views[app.cur_vid].kind, "cross")
+        self.assertEqual(app.cur_vid, "N_notifications")
+        self.assertFalse(app.nav.exists("R13"))
+
+    def test_toggling_inferred_matches_refreshes_the_linked_rows(self):
+        app = self.app
+        calls = app.g.views["E_calls"].rows
+        idx = next(i for i, r in enumerate(calls) if r["CallID"] == 1)
+        scopes = lambda: {app.links.set(i, "scope") for i in app.links.get_children()}
+        app.show_cross.set(True)
+        app.show("E_calls", select_index=idx)
+        app.on_row()
+        self.assertIn("other database (inferred)", scopes())
+        app.show_cross.set(False)
+        app.on_cross_toggle()
+        self.assertEqual(app.cur_vid, "E_calls")
+        self.assertNotIn("other database (inferred)", scopes())
+
+    # ---- 3 nearby minutes
+    def test_nearby_minutes_is_validated_and_clamped(self):
+        app = self.app
+        for text, want in (("30", 30), ("", 30), ("abc", 30), ("-5", 1), ("99999", 1440), (" 7 ", 7), ("1.5", 7)):
+            app.window_min.set(text)
+            self.assertEqual(app.nearby(), want, repr(text))
+            app.show(app.cur_vid)            # never raises, whatever is in the box
+            app.fill_nav()
+            app.friendly("R21")
+
+    def test_rebuild_normalises_the_nearby_box(self):
+        app = self.app
+        app.window_min.set("99999")
+        app.rebuild()
+        self.assertEqual(app.window_min.get(), "1440")
+        app.window_min.set("")
+        app.rebuild()
+        self.assertEqual(app.window_min.get(), "1440")
+
+    # ---- 4/5 export
+    def export_to(self, path, vid="E_calls"):
+        self.app.show(vid)
+        with mock.patch.object(V.filedialog, "asksaveasfilename", return_value=path):
+            self.app.export()
+
+    def test_export_failure_is_shown_and_not_a_success_message(self):
+        self.export_to(os.path.join(self.tmp.name, "ok.csv"))
+        self.assertIn("Exported", self.app.status.cget("text"))
+        bad = os.path.join(self.tmp.name, "no_such_folder", "x.csv")
+        with mock.patch.object(V.messagebox, "showerror") as err:
+            self.export_to(bad)
+        self.assertEqual(err.call_count, 1)
+        self.assertNotIn("Exported", self.app.status.cget("text"))
+        self.assertIn("FAILED", self.app.status.cget("text"))
+        self.assertFalse(os.path.exists(bad))
+
+    def test_export_is_atomic(self):
+        out = os.path.join(self.tmp.name, "keep.csv")
+        with open(out, "w") as f:
+            f.write("old content")
+        calls = {"n": 0}
+        real = V.csv_cell
+
+        def boom(x):
+            calls["n"] += 1
+            if calls["n"] > 8:
+                raise OSError("disk full")
+            return real(x)
+        with mock.patch.object(V, "csv_cell", boom), mock.patch.object(V.messagebox, "showerror"):
+            self.export_to(out)
+        with open(out) as f:
+            self.assertEqual(f.read(), "old content")
+        self.assertEqual([n for n in os.listdir(self.tmp.name) if n.endswith(".tmp")], [])
+        self.assertIn("FAILED", self.app.status.cget("text"))
+
+    def test_csv_cells_are_excel_safe(self):
+        c = V.csv_cell
+        for danger in ("=1+1", "@SUM(A1)", "\tx", "\rx", "+cmd|x", "-cmd", "+ 1", "-A1"):
+            self.assertEqual(c(danger), "'" + danger, danger)
+        for same in ("+15550100", "-5", "-5.5", "+1 555", "hello", "", "a=b", "12"):
+            self.assertEqual(c(same), same, same)
+        self.assertEqual(c(None), "")
+        self.assertEqual(c(42), "42")
+        self.assertEqual(c(-3), "-3")
+        self.assertEqual(c(b"\x00\x01\x02"), "<3 bytes>")
+        self.assertEqual(c("a\x00b"), "ab")
+        self.assertEqual(c("\x00=1"), "'=1")      # NULs go first, then the formula check
+
+    def test_export_writes_safe_cells_and_says_so(self):
+        v = self.app.g.views["E_calls"]
+        v.rows[0]["ContactName"] = "=HYPERLINK(1)"
+        v.rows[1]["ContactName"] = b"\xff\xfe"
+        v.rows[2]["ContactName"] = "+15550100"
+        out = os.path.join(self.tmp.name, "safe.csv")
+        self.export_to(out)
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        col = v.cols.index("ContactName")
+        got = [r[col] for r in rows[1:4]]
+        self.assertEqual(got, ["'=HYPERLINK(1)", "<2 bytes>", "+15550100"])
+        self.assertIn("Excel-safe", self.app.status.cget("text"))
+
+    # ---- 6 failed device switch
+    def bad_device(self, name="bad"):
+        bad = pldemo.build(os.path.join(self.tmp.name, name))
+        with open(os.path.join(bad, "calling.db"), "wb") as f:
+            f.write(b"this is not a database" * 100)
+        return bad
+
+    def test_failed_device_switch_keeps_the_previous_device(self):
+        app = self.make([("good", self.src), ("bad", self.bad_device())])
+        old_ev, old_g, old_work = app.ev, app.g, app.ev.work
+        before = {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("plrelate-")}
+        app.dev_combo.current(1)
+        with mock.patch.object(V.messagebox, "showerror") as err:
+            app.load_device(1)
+        self.assertEqual(err.call_count, 1)
+        self.assertIs(app.ev, old_ev)
+        self.assertIs(app.g, old_g)
+        self.assertTrue(os.path.isdir(old_work), "the previous device's copies must stay")
+        self.assertEqual(app.dev_combo.current(), 0)
+        self.assertIn("good", app.src_lbl.cget("text"))
+        self.assertNotIn("bad", app.src_lbl.cget("text"))
+        after = {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("plrelate-")}
+        self.assertEqual(after - before, set(), "the failed device's partial copy must be removed")
+        app.show("E_calls")                   # still fully usable
+        self.assertTrue(app.table.get_children())
+
+    def test_successful_device_switch_removes_the_old_copies(self):
+        d2 = pldemo.build(os.path.join(self.tmp.name, "device2"))
+        app = self.make([("one", self.src), ("two", d2)])
+        old = app.ev.work
+        app.load_device(1)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.isdir(app.ev.work))
+        self.assertEqual(app.dev_combo.current(), 1)
+
+    def test_failed_open_folder_keeps_the_previous_device_list(self):
+        app = self.app
+        folder = os.path.join(self.tmp.name, "other")
+        bad = self.bad_device("other")
+        old_devices = app.devices
+        with mock.patch.object(V.filedialog, "askdirectory", return_value=bad), \
+                mock.patch.object(V.messagebox, "showerror") as err:
+            app.open_folder()
+        self.assertEqual(err.call_count, 1)
+        self.assertIs(app.devices, old_devices)
+        self.assertEqual(app.cur_vid, "N_notifications")
+        self.assertIn("demo", app.src_lbl.cget("text"))
+
+    # ---- 8 this-PC detection
+    def test_this_pc_detection_is_the_exact_package_folder(self):
+        base = os.path.join(self.tmp.name, "Local")
+        pkg = os.path.join(base, "Packages", "Microsoft.YourPhone_8wekyb3d8bbwe")
+        f = lambda p: V.is_this_pc_package(p, base)
+        self.assertTrue(f(pkg))
+        self.assertTrue(f(os.path.join(pkg, "LocalCache", "Indexed")))
+        self.assertTrue(f(pkg.upper()))
+        self.assertFalse(f(os.path.join(base, "Temp", "case", "export")))
+        self.assertFalse(f(base + "Low"))
+        self.assertFalse(f(os.path.join(base + "Low", "Packages", "Microsoft.YourPhone_8wekyb3d8bbwe")))
+        self.assertFalse(f(pkg + "_copy"))
+        self.assertFalse(f(os.path.join(base, "Packages", "Other")))
+
+    # ---- 9 callback errors
+    def test_callback_errors_are_shown_and_printed(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with mock.patch.object(V.messagebox, "showerror") as box, contextlib.redirect_stderr(err):
+            self.app.after(0, lambda: 1 / 0)
+            self.app.update()
+        self.assertEqual(box.call_count, 1)
+        self.assertIn("ZeroDivisionError", box.call_args[0][1])
+        self.assertIn("Traceback", err.getvalue())
+
+    # ---- 10 small fixes
+    def test_handlers_do_nothing_without_a_loaded_device(self):
+        with mock.patch.object(V.messagebox, "showerror"):
+            app = self.make([("bad", self.bad_device())])
+        self.assertIsNone(app.g)
+        with mock.patch.object(V.messagebox, "showerror") as err, \
+                mock.patch.object(V.filedialog, "asksaveasfilename", return_value="x.csv"):
+            for fn in (app.on_row, app.on_jump, app.on_nav, app.export, app.rebuild, app.populate, app.fill_nav,
+                       app.on_cross_toggle, lambda: app.sort_by("x"), lambda: app.show("N_notifications")):
+                fn()
+        self.assertEqual(err.call_count, 0)
+
+    def test_sort_direction_is_remembered_per_view(self):
+        app = self.app
+        ids = lambda: [float(app.g.views[app.cur_vid].rows[int(k)]["CallID"]) for k in app.table.get_children()]
+        app.show("E_calls")
+        app.sort_by("CallID")                  # E_calls is now sorted ascending; its next click is descending
+        self.assertEqual(ids(), sorted(ids()))
+        other = next(v for v in app.g.views if v != "E_calls" and "CallID" in app.g.views[v].cols
+                     and len(app.g.views[v].rows) > 1)
+        app.show(other)
+        app.sort_by("CallID")                  # first click in this view: ascending, whatever E_calls did
+        self.assertEqual(ids(), sorted(ids()))
+
+    def test_selected_row_box_is_read_only_but_selectable(self):
+        app = self.app
+        app.show("E_calls", select_index=0)
+        app.on_row()
+        self.assertEqual(app.detail.cget("state"), "disabled")
+        text = app.detail.get("1.0", "end").strip()
+        self.assertTrue(text)
+        app.detail.tag_add("sel", "1.0", "end")
+        self.assertTrue(app.detail.tag_ranges("sel"))
+        app.detail.insert("end", "typed")      # a disabled Text ignores inserts
+        self.assertEqual(app.detail.get("1.0", "end").strip(), text)
+        app.populate()                         # clearing on refill still works
+        self.assertEqual(app.detail.get("1.0", "end").strip(), "")
+
+    def test_enter_on_a_linked_row_jumps(self):
+        app = self.make([("demo", self.src)], withdraw=False)    # key events need a mapped window
+        app.show_cross.set(True)
+        calls = app.g.views["E_calls"].rows
+        idx = next(i for i, r in enumerate(calls) if r["CallID"] == 1)
+        app.show("E_calls", select_index=idx)
+        app.update()                          # let the table's selection event run first
+        app.on_row()
+        target = next(iid for iid, t in app.link_targets.items() if t == ("contact", 1))
+        app.links.selection_set(target)
+        self.assertTrue(app.links.bind("<Return>"))
+        app.links.focus_force()
+        app.links.event_generate("<Return>")
+        app.update()
+        self.assertEqual(app.cur_vid, "E_contacts")
+
+    def test_linked_rows_panel_names_r21_with_the_current_window(self):
+        app = self.app
+        app.window_min.set("17")
+        app.rebuild()
+        app.show_cross.set(True)
+        app.g.link("R21", ("call", 1), ("call", 2), "")        # a link with no note of its own: the panel names the view
+        idx = next(i for i, r in enumerate(app.g.views["E_calls"].rows) if r["CallID"] == 1)
+        app.show("E_calls", select_index=idx)
+        app.on_row()
+        hows = [app.links.set(k, "how") for k in app.links.get_children()]
+        self.assertIn("Things within 17 min of each other", hows)
+
+    # ---- 11 snapshot warning
+    def test_snapshot_note_is_a_warning_in_the_status_bar(self):
+        class Noted(V.R.Evidence):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.snapshot_note = "SNAPSHOT-NOTE-TEXT"
+        self.assertNotIn("WARNING", self.app.status.cget("text"))
+        with mock.patch.object(V.R, "Evidence", Noted):
+            self.app.load_device(0)
+        self.assertIn("WARNING", self.app.status.cget("text"))
+        self.assertIn("SNAPSHOT-NOTE-TEXT", self.app.status.cget("text"))
+
+
+class DemoRedactionTest(unittest.TestCase):
+    def test_demo_mode_never_shows_a_local_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pldemo.build_package(tmp)
+            app = V.Viewer(V.P.find_device_dirs(root), localcache=V.D.find_localcache(root),
+                           connections=V.C.demo_source(), redact=True)
+            app.withdraw()
+            app.update()
+            try:
+                needles = {os.path.normcase(x) for x in (tmp, tempfile.gettempdir(), app.ev.work, app.pc.work)}
+                texts = {"status": app.status.cget("text"), "source": app.src_lbl.cget("text")}
+                app.show_cross.set(True)
+                app.fill_nav()
+                for vid in app.g.views:
+                    app.show(vid)
+                    texts["banner " + vid] = app.basis_lbl.cget("text")
+                    texts["status " + vid] = app.status.cget("text")
+                for what, text in texts.items():
+                    low = os.path.normcase(text)
+                    for n in needles:
+                        self.assertNotIn(n, low, what)
+                self.assertIn("synthetic demo folder", texts["banner P_copies"])
+                self.assertIn("synthetic demo folder", texts["banner PC_copies"])
+                shown = []
+                with mock.patch.object(V.messagebox, "showerror", lambda t, m: shown.append(m)), \
+                        mock.patch.object(V.filedialog, "asksaveasfilename",
+                                          return_value=os.path.join(tmp, "nope", "x.csv")):
+                    app.export()
+                self.assertTrue(shown)
+                self.assertNotIn(os.path.normcase(tmp), os.path.normcase(shown[0]))
+                self.assertNotIn(os.path.normcase(tmp), os.path.normcase(app.status.cget("text")))
+            finally:
+                app.on_close(warn=False)
 
 
 if __name__ == "__main__":

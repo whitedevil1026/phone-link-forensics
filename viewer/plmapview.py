@@ -3,7 +3,7 @@ plmapview.py - Phone Link relations viewer.
 
 Shows the SQLECmd map output for a Phone Link device folder, every table as an
 entity list, and 25 relations between the tables. Select a row to see every row
-it links to; double-click a link to jump to that row in its own table.
+it links to; double-click a link (or press Enter) to jump to that row in its own table.
 
 Works on COPIES only (staged by plrelate / plparse, hash-verified, read-only).
 Standard library only.
@@ -18,10 +18,12 @@ import os
 import re
 import sys
 import tempfile
+import traceback
 
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
+    from tkinter import font as tkfont
 except ImportError:  # pragma: no cover
     sys.exit("tkinter is not available in this Python")
 
@@ -208,6 +210,62 @@ COL_ENTITY = {"CallID": "call", "ContactID": "contact", "ThreadID": "thread", "M
 VIEW_COL_ENTITY = {vid: {"MessageID": "sms"} for vid in ("R03", "R09", "R10", "R15")}
 
 
+PHONE_LINK_PACKAGE = "Microsoft.YourPhone_8wekyb3d8bbwe"
+NEARBY_MIN, NEARBY_MAX = 1, 1440     # the Nearby box, in minutes
+DEMO_PATH = "(synthetic demo folder)"
+WARN_COLOUR, STATUS_COLOUR = "#ffb74d", "#9fb3c8"
+
+
+def is_this_pc_package(path, local_appdata=None):
+    """True when path is this PC's own Phone Link package folder, or inside it (not a look-alike prefix)."""
+    base = local_appdata or os.path.expandvars("%LOCALAPPDATA%")
+    pkg = os.path.normcase(os.path.abspath(os.path.join(base, "Packages", PHONE_LINK_PACKAGE)))
+    here = os.path.normcase(os.path.abspath(os.path.expandvars(path)))
+    try:
+        return os.path.commonpath([here, pkg]) == pkg
+    except ValueError:   # a different drive
+        return False
+
+
+def elide_middle(text, n):
+    """text shortened to n characters by replacing its middle with an ellipsis (start and end stay readable)."""
+    if len(text) <= n:
+        return text
+    keep = max(n - 1, 2)
+    head = (keep + 1) // 2
+    return text[:head] + "\u2026" + text[len(text) - (keep - head):]
+
+
+def csv_cell(x):
+    """One CSV cell that Excel will show as text: no formulas, no NULs, no raw bytes."""
+    if x is None:
+        return ""
+    if isinstance(x, (bytes, bytearray, memoryview)):
+        return f"<{len(bytes(x))} bytes>"
+    s = str(x).replace("\x00", "")
+    if s[:1] in ("=", "@", "\t", "\r") or (s[:1] in ("+", "-") and s[1:2] and not s[1:2].isdigit()):
+        return "'" + s
+    return s
+
+
+def write_csv_atomic(path, header, rows):
+    """Write a CSV next to path and move it into place, so a failure never leaves a half-written or old-looking file."""
+    fd, tmp = tempfile.mkstemp(prefix=".export-", suffix=".tmp", dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([csv_cell(c) for c in header])
+            for r in rows:
+                w.writerow([csv_cell(c) for c in r])
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _dpi_aware():
     """Crisp text on scaled Windows displays, and window coordinates that match the screen."""
     if os.name == "nt":
@@ -229,8 +287,11 @@ class Viewer(tk.Tk):
         self.connections = C.CachedSource(connections) if connections is not None else None
         self.pc = None
         self.leftovers = []
-        self.window_min = tk.IntVar(value=window_min)
-        self.ev = self.g = None
+        self._last_min = min(NEARBY_MAX, max(NEARBY_MIN, int(window_min)))   # last valid Nearby value
+        self.built_min = self._last_min      # the window the current relations were built with
+        self.window_min = tk.StringVar(value=str(self._last_min))   # text: the box can hold anything while typing
+        self.ev = self.g = self.dev_idx = None
+        self.src_full = ""
         self.show_cross = tk.BooleanVar(value=False)
         self.cur_vid = None
         self.cur_rows = []
@@ -260,26 +321,36 @@ class Viewer(tk.Tk):
     def _layout(self):
         bar = tk.Frame(self, bg=PANEL, height=52)
         bar.pack(fill="x")
-        tk.Label(bar, text="Phone Link Relations Viewer", bg=PANEL, fg="white",
-                 font=("Cambria", 15, "bold")).pack(side="left", padx=14, pady=10)
-        self.src_lbl = tk.Label(bar, text="", bg=PANEL, fg="#9fb3c8", font=("Segoe UI", 9))
-        self.src_lbl.pack(side="left", padx=8)
-        tk.Button(bar, text="Export view (CSV)", command=self.export, relief="flat", bg="#2ec4b6", fg="white",
-                  padx=10).pack(side="right", padx=8)
-        tk.Button(bar, text="Open folder...", command=self.open_folder, relief="flat", bg="#1e3a56", fg="white",
-                  padx=10).pack(side="right", padx=4)
-        tk.Checkbutton(bar, text="Show inferred matches", variable=self.show_cross, command=self.fill_nav,
-                       bg=PANEL, fg="#9fb3c8", selectcolor=PANEL, activebackground=PANEL).pack(side="right", padx=12)
+        # the controls are packed first so they always get their space; the title is what yields on a narrow window
+        self.export_btn = tk.Button(bar, text="Export view (CSV)", command=self.export, relief="flat", bg="#2ec4b6",
+                                    fg="white", padx=10)
+        self.export_btn.pack(side="right", padx=8)
+        self.open_btn = tk.Button(bar, text="Open folder...", command=self.open_folder, relief="flat", bg="#1e3a56",
+                                  fg="white", padx=10)
+        self.open_btn.pack(side="right", padx=4)
+        self.cross_chk = tk.Checkbutton(bar, text="Show inferred matches", variable=self.show_cross,
+                                        command=self.on_cross_toggle, bg=PANEL, fg="#9fb3c8", selectcolor=PANEL,
+                                        activebackground=PANEL)
+        self.cross_chk.pack(side="right", padx=12)
         tk.Label(bar, text="Nearby (min):", bg=PANEL, fg="#9fb3c8").pack(side="right", padx=(12, 2))
-        sp = tk.Spinbox(bar, from_=1, to=1440, width=5, textvariable=self.window_min, command=self.rebuild)
-        sp.bind("<Return>", lambda e: self.rebuild())
-        sp.pack(side="right")
+        self.nearby_spin = tk.Spinbox(bar, from_=NEARBY_MIN, to=NEARBY_MAX, width=5, textvariable=self.window_min,
+                                      command=self.rebuild)
+        self.nearby_spin.bind("<Return>", lambda e: self.rebuild())
+        self.nearby_spin.pack(side="right")
         self.dev_combo = ttk.Combobox(bar, state="readonly", width=38,
                                       values=[f"{lbl}" for lbl, _ in self.devices])
         self.dev_combo.bind("<<ComboboxSelected>>", lambda e: self.load_device(self.dev_combo.current()))
         if len(self.devices) > 1:
             tk.Label(bar, text="Device:", bg=PANEL, fg="#9fb3c8").pack(side="right", padx=(12, 2))
             self.dev_combo.pack(side="right")
+        tk.Label(bar, text="Phone Link Relations Viewer", bg=PANEL, fg="white",
+                 font=("Cambria", 15, "bold")).pack(side="left", padx=14, pady=10)
+        # the source line has a row of its own, so a long path can never push a control off the toolbar
+        srcrow = tk.Frame(self, bg=PANEL)
+        srcrow.pack(fill="x")
+        self.src_lbl = tk.Label(srcrow, text="", bg=PANEL, fg="#9fb3c8", font=("Segoe UI", 9), anchor="w", width=1)
+        self.src_lbl.pack(fill="x", padx=14, pady=(0, 6))
+        self.src_lbl.bind("<Configure>", lambda e: self._fit_src())
 
         body = tk.PanedWindow(self, orient="horizontal", sashwidth=4, bg=BG)
         body.pack(fill="both", expand=True)
@@ -344,9 +415,13 @@ class Viewer(tk.Tk):
         self.detail = tk.Text(dframe, height=9, wrap="word", bg="white", fg=INK, relief="flat",
                               font=("Segoe UI", 9), padx=10, pady=6)
         self.detail.pack(fill="both", expand=True, padx=12, pady=(2, 8))
+        self.detail.config(state="disabled")      # read-only, but the text can still be selected and copied
+        self.detail.tag_configure("k", font=("Segoe UI", 9, "bold"), foreground=MUTED)
+        self.detail.bind("<Button-1>", lambda e: self.detail.focus_set())   # a disabled Text does not take focus itself
+        self.detail.bind("<Control-a>", lambda e: (self.detail.tag_add("sel", "1.0", "end"), "break")[1])
         lframe = tk.Frame(bottom, bg=BG)
         bottom.add(lframe, minsize=420)
-        tk.Label(lframe, text="LINKED ROWS  (double-click to jump)", bg=BG, fg=MUTED,
+        tk.Label(lframe, text="LINKED ROWS  (double-click or Enter to jump)", bg=BG, fg=MUTED,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6)
         self.links = ttk.Treeview(lframe, columns=("how", "target", "where", "scope"), show="headings", height=8)
         for c, w, t in (("target", 280, "Linked row"), ("where", 300, "Found in"), ("how", 380, "How it is linked"),
@@ -361,72 +436,149 @@ class Viewer(tk.Tk):
         links_x.pack(side="bottom", fill="x", padx=6)
         self.links.pack(fill="both", expand=True, padx=6, pady=(2, 4))
         self.links.bind("<Double-1>", self.on_jump)
+        self.links.bind("<Return>", self.on_jump)
+        self.links.bind("<KP_Enter>", self.on_jump)
         self.link_targets = {}
 
         self.status = tk.Label(self, text="", bg=PANEL, fg="#9fb3c8", anchor="w", font=("Segoe UI", 8), padx=12)
         self.status.pack(fill="x", side="bottom")
 
     # ------------------------------------------------------------ data
-    def load_device(self, i, initial=None):
-        if self.ev:
-            self._remember(self.ev.close())
-        label, path = self.devices[i]
-        self.dev_combo.current(i)
+    def nearby(self):
+        """The Nearby box as a whole number of minutes, 1-1440. Empty or non-numeric text keeps the last valid value."""
+        try:
+            n = int(str(self.window_min.get()).strip())
+        except (ValueError, tk.TclError):
+            return self._last_min
+        self._last_min = min(NEARBY_MAX, max(NEARBY_MIN, n))
+        return self._last_min
+
+    def _load(self, path, minutes):
+        """Copy, verify and relate one device. Returns (evidence, graph, linked-phones copy); nothing is kept on failure."""
+        ev = R.Evidence(path)
+        try:
+            g = R.build(ev, minutes)
+            pc = self._add_linked_phones(g)
+        except BaseException:
+            self._remember(ev.close())
+            raise
+        return ev, g, pc
+
+    def load_device(self, i, initial=None, devices=None):
+        """Load device i of self.devices (or of `devices`, which then replaces it). A failure changes nothing: the
+        previous device stays loaded, the picker goes back to it, and its copies are not touched."""
+        pool = self.devices if devices is None else devices
+        label, path = pool[i]
         self.config(cursor="watch")
         self.update_idletasks()
+        minutes = self.nearby()
         try:
-            self.ev = R.Evidence(path)
-            self.g = R.build(self.ev, self.window_min.get())
-            self._add_linked_phones()
+            ev, g, pc = self._load(path, minutes)
         except Exception as e:  # report and keep the window usable
             self.config(cursor="")
-            messagebox.showerror("Could not load", f"{path}\n\n{type(e).__name__}: {e}")
-            return
+            if self.g is not None and self.dev_idx is not None:
+                self.dev_combo.current(self.dev_idx)
+            kept = "\n\nThe previous device is still shown." if self.g is not None else ""
+            messagebox.showerror("Could not load", self._scrub(f"{self._shown(path)}\n\n{self._why(e)}") + kept)
+            return False
         self.config(cursor="")
-        self.src_lbl.config(text=f"{label}  -  {self._shown(path)}")
+        old = (self.ev, self.pc)
+        self.ev, self.g, self.pc, self.built_min = ev, g, pc, minutes
+        for o in old:
+            if o:
+                self._remember(o.close())
+        if devices is not None:
+            self.devices = devices
+            self.dev_combo["values"] = [lbl for lbl, _ in devices]
+            self.cur_vid = None
+        self.dev_idx = i
+        self.dev_combo.current(i)
+        self._set_source(f"{label}  -  {self._shown(path)}")
         ok = sum(v["copy_matches"] == "yes" for v in self.ev.verify)
-        self.status.config(text=f"Read-only COPIES in {self._shown(self.ev.work)}  |  {ok}/{len(self.ev.verify)} copies match "
-                                f"their source SHA-256  |  the source folder is never opened by SQLite  |  "
-                                f"{len(self.g.relations)} relations, "
-                                f"{sum(len(x) for x in self.g.edges.values()) // 2:,} links")
-        old = [] if self.redact else stale_copies(exclude=[self.ev.work] + ([self.pc.work] if self.pc else []))
-        if old:
-            self.status.config(text=self.status.cget("text") + f"  |  {len(old)} leftover copy folder(s) from earlier "
-                                                                 f"runs in {self._shown(os.path.dirname(old[0]))} - "
-                                                                 f"remove when done")
+        text = (f"Read-only COPIES in {self._shown(self.ev.work)}  |  {ok}/{len(self.ev.verify)} copies match "
+                f"their source SHA-256  |  the source folder is never opened by SQLite  |  "
+                f"{len(self.g.relations)} relations, "
+                f"{sum(len(x) for x in self.g.edges.values()) // 2:,} links")
+        stale = [] if self.redact else stale_copies(exclude=[self.ev.work] + ([self.pc.work] if self.pc else []))
+        if stale:
+            text += (f"  |  {len(stale)} leftover copy folder(s) from earlier runs in "
+                     f"{self._shown(os.path.dirname(stale[0]))} - remove when done")
+        self._status(text)
         self.fill_nav()
         self.show(initial or self.cur_vid or "N_notifications")
+        return True
 
     def rebuild(self):
-        if not self.ev:
+        if not self.ev or self.g is None:
             return
-        try:
-            self.g = R.build(self.ev, int(self.window_min.get()))
-        except (ValueError, tk.TclError):
+        minutes = self.nearby()
+        self.window_min.set(str(minutes))      # show the value actually used
+        if minutes == self.built_min:
             return
-        self._add_linked_phones()
+        g = R.build(self.ev, minutes)
+        old_pc, self.pc = self.pc, self._add_linked_phones(g)
+        if old_pc:
+            self._remember(old_pc.close())
+        self.g, self.built_min = g, minutes
         self.fill_nav()
         self.show(self.cur_vid)
 
-    def _add_linked_phones(self):
-        """Package-level views: every phone ever linked to this PC (copied and verified separately)."""
-        if self.pc:
-            self._remember(self.pc.close())
-            self.pc = None
+    def _add_linked_phones(self, g):
+        """Package-level views: every phone ever linked to this PC (copied and verified separately).
+        Adds them to graph g and returns the copy (or None)."""
+        pc = None
         try:
-            _, self.pc = D.build(self.localcache, self.g, R.View, R.ts_seconds, R.iso)
+            _, pc = D.build(self.localcache, g, R.View, R.ts_seconds, R.iso)
         except (OSError, ValueError) as e:
-            self.g.add_view(R.View("PC_devices", "Phone pairings (device folders)", "pc", f"could not read: {e}",
-                                   ["Error"], [{"Error": str(e)}]))
+            g.add_view(R.View("PC_devices", "Phone pairings (device folders)", "pc", f"could not read: {e}",
+                              ["Error"], [{"Error": str(e)}]))
         if self.connections is not None:
             try:
-                C.build(self.connections, self.g, R.View)
+                C.build(self.connections, g, R.View)
             except OSError as e:
-                self.g.add_view(R.View("C_phones", "Phone connections", "conn", f"could not read: {e}", ["Error"],
-                                       [{"Error": str(e)}]))
+                g.add_view(R.View("C_phones", "Phone connections", "conn", f"could not read: {e}", ["Error"],
+                                  [{"Error": str(e)}]))
+        return pc
 
     def _shown(self, path):
-        return "(synthetic demo folder)" if self.redact else path
+        return DEMO_PATH if self.redact else path
+
+    def _why(self, e):
+        """A short reason for an error, without the file name some exceptions carry."""
+        return f"{type(e).__name__}: {e.strerror if isinstance(e, OSError) and e.strerror else e}"
+
+    def _scrub(self, text):
+        """Demo mode: replace this computer's folders (the copies, the temp folder, the sources) in text."""
+        if not self.redact:
+            return text
+        known = [getattr(o, a, None) for o in (self.ev, self.pc) if o for a in ("src", "work")]
+        known += [self.localcache, tempfile.gettempdir()] + [d for _, d in self.devices]
+        paths = set()
+        for k in known:
+            if k:
+                for f in (os.path.abspath, os.path.realpath):
+                    paths.add(f(k))
+        for k in sorted(paths, key=len, reverse=True):
+            for form in (k, k.replace("\\", "/")):
+                text = re.sub(re.escape(form), lambda m: DEMO_PATH, text, flags=re.IGNORECASE)
+        return text
+
+    def _status(self, text, warn=False):
+        """The status bar. A snapshot warning from the evidence copy is always kept on it."""
+        note = getattr(self.ev, "snapshot_note", "") if self.ev else ""
+        if note:
+            text += f"  |  WARNING: {note}"
+        self.status.config(text=self._scrub(text), fg=WARN_COLOUR if warn or note else STATUS_COLOUR)
+
+    def _set_source(self, text):
+        self.src_full = self._scrub(text)
+        self._fit_src()
+
+    def _fit_src(self):
+        """Show the source line shortened in the middle so it fits the window width."""
+        w = self.src_lbl.winfo_width()
+        chars = max(20, w // max(1, tkfont.Font(font=self.src_lbl.cget("font")).measure("0")) - 2) if w > 1 else 120
+        self.src_lbl.config(text=elide_middle(self.src_full, chars))
 
     def _remember(self, leftover):
         if leftover:
@@ -434,10 +586,12 @@ class Viewer(tk.Tk):
 
     def fill_nav(self):
         """The view list: topic groups in plain English, row counts on the right, sub-headings folded away."""
+        if self.g is None:
+            return
         opened = {i for i in self._all_nav_ids() if self.nav.item(i, "open")} if self.nav.get_children() else None
         self.nav.delete(*self.nav.get_children())
         shown = [v for v in self.g.views.values() if v.kind != "cross" or self.show_cross.get()]
-        places = {v.vid: nav_place(v, self.window_min.get()) for v in shown}
+        places = {v.vid: nav_place(v, self.built_min) for v in shown}
         rank = {vid: i for i, vid in enumerate(NAV)}
         built = {vid: i for i, vid in enumerate(self.g.views)}
         for gid, heading, open_default in GROUPS:
@@ -477,16 +631,30 @@ class Viewer(tk.Tk):
 
     def friendly(self, vid):
         """'Group > name' for a view, as the view list shows it."""
-        gid, _, name = nav_place(self.g.views[vid], self.window_min.get())
+        gid, _, name = nav_place(self.g.views[vid], self.built_min)
         return f"{GROUP_SHORT.get(gid) or dict((g, h) for g, h, _ in GROUPS).get(gid, gid)} \u203a {name}"
 
     # ------------------------------------------------------------ views
     def on_nav(self, _=None):
         sel = self.nav.selection()
-        if sel and not sel[0].startswith(("grp:", "sub:")) and sel[0] != self.cur_vid:
+        if self.g is not None and sel and not sel[0].startswith(("grp:", "sub:")) and sel[0] != self.cur_vid:
             self.show(sel[0], from_nav=True)
 
+    def on_cross_toggle(self):
+        """The 'Show inferred matches' box changed: refresh the view list and the linked rows, and leave an inferred
+        view that is no longer allowed."""
+        if self.g is None:
+            return
+        self.fill_nav()
+        cur = self.g.views.get(self.cur_vid)
+        if cur is not None and cur.kind == "cross" and not self.show_cross.get():
+            self.show("N_notifications")        # falls back to the first view when there are no notifications
+        elif self.table.selection():
+            self.on_row()
+
     def show(self, vid, from_nav=False, select_index=None):
+        if self.g is None:
+            return
         if vid not in self.g.views:
             vid = next(iter(self.g.views))
         v = self.g.views[vid]
@@ -495,11 +663,11 @@ class Viewer(tk.Tk):
             self.nav.selection_set(vid)
             self.nav.see(vid)
         name, colour, meaning = KIND[v.kind]
-        self.title_lbl.config(text=nav_place(v, self.window_min.get())[2])
+        self.title_lbl.config(text=nav_place(v, self.built_min)[2])
         self.kind_lbl.config(text=BADGE.get(v.kind, v.kind.upper()), bg=colour)
         where = f"{v.db}  -  " if v.db else ""
-        self.basis_lbl.config(text=f"{where}{meaning}.   Source: {v.basis}.   Technical name: {v.vid} \u2013 "
-                                   f"{v.title}", fg=colour)
+        self.basis_lbl.config(text=self._scrub(f"{where}{meaning}.   Source: {v.basis}.   Technical name: {v.vid} "
+                                               f"\u2013 {v.title}"), fg=colour)
         self.table["columns"] = v.cols
         for c in v.cols:
             self.table.heading(c, text=c, command=lambda c=c: self.sort_by(c))
@@ -527,7 +695,7 @@ class Viewer(tk.Tk):
             self.cur_rows.append(i)
             self.table.insert("", "end", iid=str(i), values=vals)
         self.count_lbl.config(text=f"{len(self.cur_rows):,} of {len(v.rows):,} rows")
-        self.detail.delete("1.0", "end")
+        self._detail_set()
         self.links.delete(*self.links.get_children())
         if select_index is not None and str(select_index) in self.table.get_children():
             self.table.selection_set(str(select_index))
@@ -537,7 +705,9 @@ class Viewer(tk.Tk):
     def sort_by(self, col):
         # sort the row list and refill: moving 30,000 Tk items one by one took about 6 s, and keeping
         # cur_rows in display order makes Export write what the screen shows
-        rev = self.sort_state.get(col, False)
+        if self.g is None or self.cur_vid not in self.g.views:
+            return
+        rev = self.sort_state.get((self.cur_vid, col), False)      # each view remembers its own direction
         v = self.g.views[self.cur_vid]
 
         def key(i):
@@ -556,7 +726,7 @@ class Viewer(tk.Tk):
         if sel:
             self.table.selection_set(sel)
             self.table.see(sel[0])
-        self.sort_state[col] = not rev
+        self.sort_state[(self.cur_vid, col)] = not rev
 
     # ------------------------------------------------------------ links
     def row_entities(self, row):
@@ -573,24 +743,31 @@ class Viewer(tk.Tk):
                         ents.append(e)
         return ents
 
+    def _detail_set(self, parts=()):
+        """Replace the selected-row text. The box is read-only for the user, so it is unlocked only while we write."""
+        self.detail.config(state="normal")
+        self.detail.delete("1.0", "end")
+        for text, tag in parts:
+            self.detail.insert("end", text, tag)
+        self.detail.config(state="disabled")
+
     def on_row(self, _=None):
         sel = self.table.selection()
-        if not sel:
+        if self.g is None or not sel:
             return
         v = self.g.views[self.cur_vid]
         row = v.rows[int(sel[0])]
-        self.detail.delete("1.0", "end")
-        self.detail.tag_configure("k", font=("Segoe UI", 9, "bold"), foreground=MUTED)
+        parts = []
         for c in v.cols:
             val = row.get(c)
             if val in (None, ""):
                 continue
-            self.detail.insert("end", f"{c}: ", "k")
-            self.detail.insert("end", f"{val}\n")
+            parts += [(f"{c}: ", "k"), (f"{val}\n", "")]
         if row.get("_json"):
             import json
-            self.detail.insert("end", "\nRaw JSON (as stored):\n", "k")
-            self.detail.insert("end", json.dumps(row["_json"], indent=2, ensure_ascii=False))
+            parts += [("\nRaw JSON (as stored):\n", "k"),
+                      (json.dumps(row["_json"], indent=2, ensure_ascii=False), "")]
+        self._detail_set(parts)
         self.links.delete(*self.links.get_children())
         self.link_targets = {}
         n = 0
@@ -611,7 +788,7 @@ class Viewer(tk.Tk):
                     where = self.friendly(home[0])
                 iid = f"l{n}"
                 self.links.insert("", "end", iid=iid, tags=(scope,),
-                                  values=(note or (nav_place(rv)[2] if rv else rid), self.g.label.get(target, str(target)),
+                                  values=(note or (nav_place(rv, self.built_min)[2] if rv else rid), self.g.label.get(target, str(target)),
                                           where, SCOPE_WORDS.get(scope, scope)))
                 self.link_targets[iid] = target
                 n += 1
@@ -621,7 +798,7 @@ class Viewer(tk.Tk):
 
     def on_jump(self, _=None):
         sel = self.links.selection()
-        if not sel or sel[0] not in self.link_targets:
+        if self.g is None or not sel or sel[0] not in self.link_targets:
             return
         target = self.link_targets[sel[0]]
         if target not in self.g.home:
@@ -640,25 +817,35 @@ class Viewer(tk.Tk):
         if not devs:
             messagebox.showerror("No Phone Link databases", f"No Phone Link databases found under\n{d}")
             return
-        self.devices = devs
-        self.dev_combo["values"] = [lbl for lbl, _ in devs]
-        self.cur_vid = None
-        self.load_device(0)
+        self.load_device(0, devices=devs)      # the old list, view and device stay if this one cannot be loaded
 
     def export(self):
-        if not self.cur_vid:
+        if self.g is None or not self.cur_vid:
             return
         v = self.g.views[self.cur_vid]
         path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"{self.cur_vid}.csv",
                                             filetypes=[("CSV", "*.csv")])
         if not path:
             return
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(v.cols)
-            for i in self.cur_rows:
-                w.writerow([v.rows[i].get(c) for c in v.cols])
-        self.status.config(text=f"Exported {len(self.cur_rows):,} rows to {path} (contains case data - keep local)")
+        name = os.path.basename(path) if self.redact else path
+        try:
+            write_csv_atomic(path, v.cols, ([v.rows[i].get(c) for c in v.cols] for i in self.cur_rows))
+        except Exception as e:   # nothing was written to `path`; say so, and do not leave an old success message
+            self._status(f"Export FAILED - nothing was written to {name}: {self._why(e)}", warn=True)
+            messagebox.showerror("Export failed", self._scrub(f"Could not write\n{name}\n\n{self._why(e)}"))
+            return
+        self._status(f"Exported {len(self.cur_rows):,} rows to {name} - Excel-safe: cells that start with = @ + or - "
+                     f"are prefixed with ' so Excel shows them as text; bytes are written as <N bytes> "
+                     f"(contains case data - keep local)")
+
+    def report_callback_exception(self, exc, val, tb):
+        """An error inside a button, key or timer callback: print the traceback and tell the user, briefly."""
+        traceback.print_exception(exc, val, tb)
+        try:
+            messagebox.showerror("Something went wrong", self._scrub(
+                f"{exc.__name__}: {val}\n\nThe window is still open. The full details are in the console."))
+        except tk.TclError:
+            pass
 
     def on_close(self, warn=True):
         if self.ev:
@@ -668,7 +855,7 @@ class Viewer(tk.Tk):
         if self.leftovers and warn:
             messagebox.showwarning("Copies not removed", "These temporary copies of the evidence could not be "
                                    "removed (a file is still in use). Remove them yourself:\n\n" +
-                                   "\n".join(self.leftovers))
+                                   "\n".join(self._shown(p) for p in self.leftovers))
         self.destroy()
 
     def screenshot(self, path):
@@ -782,9 +969,7 @@ def main():
             sys.exit(f"No Phone Link databases found under {a.input}")
         devices.sort(key=lambda d: -len([f for f in os.listdir(d[1]) if f.endswith(".db")]))  # fullest first
         localcache = D.find_localcache(a.input)
-        own = os.path.normcase(os.path.abspath(os.path.expandvars("%LOCALAPPDATA%")))
-        is_this_pc = os.path.normcase(os.path.abspath(os.path.expandvars(a.input))).startswith(own)
-        connections = C.LiveSource() if (a.this_pc or is_this_pc) and os.name == "nt" else None
+        connections = C.LiveSource() if (a.this_pc or is_this_pc_package(a.input)) and os.name == "nt" else None
     app = Viewer(devices, a.window, a.view, localcache, connections, redact=a.demo)
     if a.select is not None:
         app.show(app.cur_vid, select_index=a.select)
