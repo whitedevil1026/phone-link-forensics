@@ -47,7 +47,10 @@ KNOWN = r"Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers\Kn
 SETUPAPI = r"C:\Windows\INF\setupapi.dev.log"
 CHANNELS = ["Microsoft-Windows-Kernel-PnP/Configuration", "Microsoft-Windows-WPD-MTPClassDriver/Operational",
             "Microsoft-Windows-Bluetooth-BthLEPrepairing/Operational"]
-DEVICE_PREFIXES = ("USB\\", "SWD\\WPDBUSENUM", "BTHENUM\\", "BTHLE\\", "USBSTOR\\")
+DEVICE_PREFIXES = ("USB\\", "SWD\\WPDBUSENUM", "BTHENUM\\", "BTHLE\\", "BTHLEDEVICE\\", "USBSTOR\\")
+EVENT_CAP = 10000   # newest events read per channel; older ones are not shown (stated in the C_events view)
+# Windows' ContainerID for "the PC itself" (not a device): zeros, then ffff, then twelve f, written in parts
+NULL_CONTAINER = "{%s-%s-%s-%s-%s}" % ("0" * 8, "0" * 4, "0" * 4, "ffff", "f" * 12)
 
 # [published] Bluetooth Core: class-of-device major classes
 BT_MAJOR = {0: "Miscellaneous", 1: "Computer", 2: "Phone", 3: "Network access point", 4: "Audio/Video",
@@ -75,7 +78,8 @@ EVENT_MEANING = {
 
 # driver services that indicate a phone on USB (the evidence for the flag is shown with it)
 PHONE_SERVICES = {"WUDFWpdMtp": "MTP phone/camera driver", "dg_ssudbus": "vendor phone USB driver",
-                  "Modem": "phone modem interface", "ssudmdm": "vendor phone modem"}
+                  "Modem": "phone modem interface", "ssudmdm": "vendor phone modem",
+                  "usbaapl64": "Apple mobile device USB driver"}
 
 
 # ---------------------------------------------------------------- sources
@@ -125,9 +129,10 @@ class LiveSource:
 
     def text(self, path):
         try:
-            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-                return f.read()
-        except OSError:
+            with open(path, "rb") as f:
+                return decode_log(f.read())
+        except OSError as e:
+            self.denied.append(f"{path}: {e.strerror or type(e).__name__}")
             return ""
 
     def setupapi(self):
@@ -136,14 +141,22 @@ class LiveSource:
         files = sorted(glob.glob(os.path.join(os.path.dirname(SETUPAPI), "setupapi.dev*.log")))
         return [(os.path.basename(f), self.text(f)) for f in files]
 
-    def events(self, channel, count=2000):
-        """[(utc 'YYYY-MM-DD HH:MM:SS', event id, {data name: value})], newest first."""
+    def events(self, channel, count=EVENT_CAP):
+        """[(utc 'YYYY-MM-DD HH:MM:SS', event id, {data name: value})], newest first. Failures go to `denied`."""
         try:
             r = subprocess.run(["wevtutil", "qe", channel, f"/c:{count}", "/rd:true", "/f:xml"],
                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.denied.append(f"event log {channel}: wevtutil failed ({type(e).__name__})")
             return []
-        return parse_events_xml(r.stdout) if r.returncode == 0 else []
+        if r.returncode != 0:
+            why = next((ln.strip() for ln in (r.stderr or "").splitlines() if ln.strip()), f"exit code {r.returncode}")
+            self.denied.append(f"event log {channel}: {why[:150]}")
+            return []
+        problems = []
+        out = parse_events_xml(r.stdout, problems)
+        self.denied.extend(f"event log {channel}: {p}" for p in problems)
+        return out
 
 
 class FakeSource:
@@ -151,8 +164,10 @@ class FakeSource:
 
     logs_in_utc = True   # synthetic logs: no time zone of the running PC is applied
 
-    def __init__(self, keys, text="", events=None):
+    def __init__(self, keys, text="", events=None, failures=None):
+        """failures: {channel: message} - reading that event log fails, as a failed wevtutil call would."""
         self.keys, self._text, self._events, self.denied = keys, text, events or {}, []
+        self._failures = failures or {}
 
     def subkeys(self, hive, path):
         return list(self.keys.get((hive, path), {}).get("subkeys", []))
@@ -169,7 +184,10 @@ class FakeSource:
     def setupapi(self):
         return [("setupapi.dev.log", self._text)]
 
-    def events(self, channel, count=2000):
+    def events(self, channel, count=EVENT_CAP):
+        if channel in self._failures:
+            self.denied.append(f"event log {channel}: {self._failures[channel]}")
+            return []
         return list(self._events.get(channel, []))
 
 
@@ -214,12 +232,31 @@ def clean_desc(v):
     return s.rsplit(";", 1)[-1] if s.startswith("@") else s
 
 
-def parse_events_xml(xml_text):
+def decode_log(raw):
+    """Text of a log file: UTF-16 when it has a BOM, otherwise UTF-8, otherwise cp1252."""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def container_of(v):
+    """A ContainerID usable for joining devices: lower case, and empty for the PC's own NULL container."""
+    c = str(v or "").strip().lower()
+    return "" if c == NULL_CONTAINER else c
+
+
+def parse_events_xml(xml_text, problems=None):
+    """Events from wevtutil's XML. A parse error is appended to the `problems` list (if given)."""
     out = []
     ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
     try:
         root = ET.fromstring("<Events>" + xml_text + "</Events>")
-    except ET.ParseError:
+    except ET.ParseError as e:
+        if problems is not None:
+            problems.append(f"event XML could not be parsed ({e})")
         return out
     for ev in root.findall("e:Event", ns):
         sysn = ev.find("e:System", ns)
@@ -263,15 +300,38 @@ def local_to_utc(s, logs_in_utc=False):
             return t.strftime("%Y-%m-%d %H:%M:%S")
         t = t.astimezone()
         return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
+    except (ValueError, OverflowError, OSError):   # Windows cannot convert local times before 1970
         return ""
 
 
 # ---------------------------------------------------------------- build
+class _Guard:
+    """Wrap a source so one failing read becomes an empty result plus a line in the 'could not read' view."""
+
+    EMPTY = {"subkeys": [], "values": {}, "last_write": None, "text": "", "setupapi": [], "events": []}
+
+    def __init__(self, src):
+        self.src, self.failed = src, []
+        self.logs_in_utc = getattr(src, "logs_in_utc", False)
+
+    def __getattr__(self, name):
+        if name not in self.EMPTY:
+            raise AttributeError(name)
+
+        def call(*args):
+            try:
+                return getattr(self.src, name)(*args)
+            except Exception as e:   # a source can fail in ways of its own; the other views must still appear
+                self.failed.append(f"{name} {' '.join(str(a) for a in args)}: {type(e).__name__}: {e}")
+                return type(self.EMPTY[name])() if self.EMPTY[name] is not None else None
+        return call
+
+
 def build(src, g, View):
     """Add the 'Phone connections (this PC)' views to graph g. Returns view ids."""
     vids, by_container, by_instance = [], {}, {}
     utc_logs = getattr(src, "logs_in_utc", False)
+    guarded, src = src, _Guard(src)
 
     def to_utc(s):
         return local_to_utc(s, utc_logs)
@@ -282,8 +342,9 @@ def build(src, g, View):
         vids.append(vid)
 
     def remember(e, container, instance):
+        container = container_of(container)      # the PC's own NULL container joins nothing
         if container:
-            by_container.setdefault(container.lower(), []).append(e)
+            by_container.setdefault(container, []).append(e)
         if instance:
             by_instance[instance.upper()] = e
 
@@ -308,7 +369,8 @@ def build(src, g, View):
             first = install.get(iid.upper(), ("",))[0]
             name = clean_desc(v.get("FriendlyName")) or clean_desc(v.get("DeviceDesc"))
             g.label[e] = f"USB {name} ({vm.group(1) if vm else '?'}:{pm.group(1) if pm else '?'})"
-            rows.append({"_e": e, "Name": name, "Manufacturer": clean_desc(v.get("Mfg")),
+            rows.append({"_e": e, "_dev": dev, "_svc": svc, "_prefix": str(v.get("ParentIdPrefix") or ""),
+                         "Name": name, "Manufacturer": clean_desc(v.get("Mfg")),
                          "VID": vm.group(1).upper() if vm else "", "PID": pm.group(1).upper() if pm else "",
                          "SerialOrInstance": inst, "Driver": svc,
                          "PhoneEvidence": PHONE_SERVICES.get(svc, ""), "ContainerID": v.get("ContainerID", ""),
@@ -316,6 +378,21 @@ def build(src, g, View):
                          "FirstInstallUTC": to_utc(first), "KeyLastWriteUTC": filetime(src.last_write(HKLM, path)),
                          "HardwareID": multi(v.get("HardwareID")), "InstanceID": iid})
             remember(e, v.get("ContainerID"), iid)
+    # a composite (usbccgp) parent of a phone interface (e.g. MTP) is the phone's USB identity and carries its serial
+    usb_parent = {}
+    for r in rows:
+        if not r["PhoneEvidence"] or not re.search(r"&MI_[0-9A-Fa-f]{2}", r["_dev"], re.I):
+            continue
+        base = re.sub(r"&MI_[0-9A-Fa-f]{2}", "", r["_dev"], flags=re.I).upper()
+        cid = container_of(r["ContainerID"])
+        for par in rows:
+            if par["_svc"].lower() != "usbccgp" or par["_dev"].upper() != base:
+                continue
+            by_prefix = par["_prefix"] and r["SerialOrInstance"].lower().startswith(par["_prefix"].lower() + "&")
+            if by_prefix or (cid and container_of(par["ContainerID"]) == cid):
+                usb_parent[r["_e"]] = par
+                par["PhoneEvidence"] = par["PhoneEvidence"] or f"composite parent (usbccgp) of a phone interface ({r['PhoneEvidence']})"
+                break
     add("C_usb", "USB devices (cable)", "HKLM\\" + USB + " - every USB device ever installed; PhoneEvidence shows "
         "why a row looks like a phone (driver service). FirstInstall from setupapi.dev.log (local time as logged)",
         ["Name", "Manufacturer", "VID", "PID", "SerialOrInstance", "Driver", "PhoneEvidence", "ContainerID",
@@ -403,8 +480,9 @@ def build(src, g, View):
             for inst in src.subkeys(HKLM, f"{base}\\{sub}"):
                 path = f"{base}\\{sub}\\{inst}"
                 v = src.values(HKLM, path)
+                tail = sub.rsplit("_", 1)[-1] if "_" in sub else ""   # ...REV&0006_c0d3fbe8f5a1
                 am = re.findall(r"([0-9A-Fa-f]{12})", inst) or re.findall(r"Dev_([0-9A-Fa-f]{12})", sub)
-                addr = am[-1].lower() if am else ""
+                addr = tail.lower() if re.fullmatch(r"[0-9A-Fa-f]{12}", tail) else am[-1].lower() if am else ""
                 um = re.match(r"\{0000([0-9a-fA-F]{4})-0000-1000-8000-00805f9b34fb\}", sub)
                 u128 = re.match(r"\{([0-9a-fA-F-]{36})\}", sub)
                 service = (BT_SERVICES.get(um.group(1).lower(), f"UUID {um.group(1).lower()}") if um else
@@ -456,9 +534,12 @@ def build(src, g, View):
         ["FirstInstallLocal", "FirstInstallUTC", "DeviceID", "Section", "Log", "MatchedDevice"], rows)
 
     # events
-    rows, mtp_phones = [], {}
+    rows, mtp_phones, capped = [], {}, []
     for ch in CHANNELS:
-        for t, eid, data in src.events(ch):
+        got = src.events(ch)
+        if len(got) >= EVENT_CAP:
+            capped.append(ch.split("/")[0].replace("Microsoft-Windows-", ""))
+        for t, eid, data in got:
             devid = next((x for x in data.values() if x.upper().startswith(DEVICE_PREFIXES)), "")
             if ch.endswith("Kernel-PnP/Configuration") and not devid:
                 continue
@@ -483,7 +564,9 @@ def build(src, g, View):
     rows.sort(key=lambda r: r["TimeUTC"], reverse=True)
     add("C_events", "Connection events (event logs)",
         "Kernel-PnP/Configuration (device configured / started), WPD-MTP and Bluetooth LE pairing logs. Logs roll over, "
-        "so only recent connections remain. Meaning = Windows' own message text for that event ID; event 1005 names the "
+        f"so only recent connections remain; at most the newest {EVENT_CAP:,} events of each log are read"
+        + (f" (reached for {', '.join(capped)} - older events are not shown)" if capped else "")
+        + ". Meaning = Windows' own message text for that event ID; event 1005 names the "
         "connected phone's make, model and OS version", ["TimeUTC", "Log", "EventID", "Meaning", "ReportedDevice",
                                                         "DeviceID", "MatchedDevice", "Data"], rows)
 
@@ -501,18 +584,25 @@ def build(src, g, View):
         "rows that share a ContainerID - Windows' own id for one physical device", ["ContainerID", "Source", "Device"],
         rel, entity=False)
 
-    phone_containers = {str(r["ContainerID"]).lower() for r in g.views["C_usb"].rows
-                        if r["PhoneEvidence"] and r["ContainerID"]}
+    phone_containers = {container_of(r["ContainerID"]) for r in g.views["C_usb"].rows
+                        if r["PhoneEvidence"]} - {""}
     phones = []
     for vid in ("C_usb", "C_wpd", "C_bt"):
         for r in g.views[vid].rows:
             why = r.get("PhoneEvidence") or ("Bluetooth class of device = Phone" if r.get("IsPhone") == "yes" else "") or \
-                ("same ContainerID as a USB phone" if vid == "C_wpd" and str(r.get("ContainerID", "")).lower()
+                ("same ContainerID as a USB phone" if vid == "C_wpd" and container_of(r.get("ContainerID"))
                  in phone_containers else "")
             if why:
+                # the grouping key for one physical device: ContainerID, else Bluetooth address, else the device id
+                phys = container_of(r.get("ContainerID")) or r.get("Address") or r.get("InstanceID", "")
+                serial = ""
+                if vid == "C_usb":
+                    owner = usb_parent.get(r["_e"], r)
+                    serial = owner["SerialOrInstance"] if "&" not in owner["SerialOrInstance"] else ""
                 phones.append({"_e": r["_e"], "How": {"C_usb": "USB cable", "C_wpd": "USB cable (MTP)",
                                                       "C_bt": "Bluetooth"}[vid], "Device": g.label[r["_e"]],
-                               "Evidence": why, "LastConnectedUTC": r.get("LastConnectedUTC", ""),
+                               "PhysicalDevice": phys, "Serial": serial, "Evidence": why,
+                               "LastConnectedUTC": r.get("LastConnectedUTC", ""),
                                "LastSeenUTC": r.get("LastSeenUTC", ""),
                                "KeyLastWriteUTC": r.get("KeyLastWriteUTC", ""),
                                "FirstInstallUTC": r.get("FirstInstallUTC", ""), "FirstSeenUTC": ""})
@@ -522,8 +612,10 @@ def build(src, g, View):
         for ee in p["events"]:
             g.link("CR4", pe, ee, "Stored link: this event 1005 names the phone")
         phones.append({"_e": pe, "How": "USB cable (MTP event 1005)", "Device": reported,
+                       "PhysicalDevice": "", "Serial": "",   # make/model/OS only: not keyed as one physical device
                        "Evidence": f"MTP driver customized for this phone ({p['n']} events, "
-                                   f"{p['first'][:10]} to {p['last'][:10]})",
+                                   f"{p['first'][:10]} to {p['last'][:10]}); same make/model/OS \u2013 may be more "
+                                   f"than one phone",
                        "LastConnectedUTC": p["last"], "LastSeenUTC": "", "FirstInstallUTC": "",
                        "KeyLastWriteUTC": "", "FirstSeenUTC": p["first"]})
     add("C_phones", "Phones connected to this PC (cable or Bluetooth) - summary",
@@ -531,11 +623,13 @@ def build(src, g, View):
         "device driver, Bluetooth class of device = Phone, or an MTP event 1005 naming the phone's make, model and OS "
         "version (this catches iPhones and other phones without a phone-specific driver). An empty LastConnected with a "
         "LastSeen means Windows saw the phone but stored no connection time",
-        ["How", "Device", "Evidence", "FirstSeenUTC", "LastConnectedUTC", "LastSeenUTC", "FirstInstallUTC",
-         "KeyLastWriteUTC"], phones)
-    if getattr(src, "denied", None):
-        add("C_denied", "Locations this account could not read", "access denied - run as administrator to include them",
-            ["Location"], [{"Location": d} for d in sorted(set(src.denied))], entity=False)
+        ["How", "Device", "PhysicalDevice", "Serial", "Evidence", "FirstSeenUTC", "LastConnectedUTC", "LastSeenUTC",
+         "FirstInstallUTC", "KeyLastWriteUTC"], phones)
+    unread = list(getattr(guarded, "denied", None) or []) + src.failed
+    if unread:
+        add("C_denied", "Locations this account could not read",
+            "access denied (run as administrator to include them) or a read that failed - the views above may be "
+            "incomplete", ["Location"], [{"Location": d} for d in sorted(set(unread))], entity=False)
     return vids
 
 
@@ -571,7 +665,7 @@ class CachedSource:
     def setupapi(self):
         return self._get("setupapi")
 
-    def events(self, channel, count=2000):
+    def events(self, channel, count=EVENT_CAP):
         return self._get("events", channel, count)
 
 

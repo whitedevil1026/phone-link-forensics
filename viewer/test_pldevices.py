@@ -2,11 +2,15 @@
 
     python test_pldevices.py
 """
+import calendar
 import hashlib
+import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -23,6 +27,227 @@ def tree_hashes(root):
             with open(p, "rb") as fh:
                 out[os.path.relpath(p, root)] = hashlib.sha256(fh.read()).hexdigest()
     return out
+
+
+G = ["aaaaaaaa-0000-4000-8000-00000000000%d" % i for i in range(1, 8)]
+
+
+def make_pkg(root, meta=None, trust=None, folders=()):
+    """A tiny synthetic LocalCache: folders = [(guid, {relative file: bytes or [(ddl, row sql), ...]})]."""
+    lc = os.path.join(root, "pkg", "LocalCache")
+    os.makedirs(os.path.join(lc, "Indexed"), exist_ok=True)
+    for guid, files in folders:
+        d = os.path.join(lc, "Indexed", guid)
+        os.makedirs(d, exist_ok=True)
+        for rel, content in files.items():
+            p = os.path.join(d, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            if isinstance(content, bytes):
+                with open(p, "wb") as f:
+                    f.write(content)
+            else:
+                con = sqlite3.connect(p)
+                for ddl, rows in content:
+                    con.execute(ddl)
+                    for r in rows:
+                        con.execute(r)
+                con.commit()
+                con.close()
+    for name, obj in ((D.META, meta), (D.TRUST, trust)):
+        if obj is not None:
+            with open(os.path.join(lc, name), "w", encoding="utf-8") as f:
+                f.write(obj if isinstance(obj, str) else json.dumps(obj))
+    return lc
+
+
+class WorkFolders:
+    """Point tempfile at a private folder so the test can count the pldevices-* folders it leaves."""
+
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old, tempfile.tempdir = tempfile.tempdir, self.tmp.name
+        return self
+
+    def left(self):
+        return [n for n in os.listdir(self.tmp.name) if n.startswith("pldevices-")]
+
+    def __exit__(self, *a):
+        tempfile.tempdir = self.old
+        self.tmp.cleanup()
+
+
+class IsoTimes(unittest.TestCase):
+    def test_seven_digit_fraction_with_offset(self):
+        text, ts = D._iso("2026-09-21T17:17:49.1234567+05:30")
+        self.assertEqual(text, "2026-09-21 11:47:49")
+        self.assertAlmostEqual(ts, calendar.timegm((2026, 9, 21, 11, 47, 49)) + 0.123456, places=5)
+
+    def test_current_format_without_fraction_and_z(self):
+        want = calendar.timegm((2026, 9, 21, 11, 47, 49))
+        self.assertEqual(D._iso("2026-09-21T17:17:49+05:30"), ("2026-09-21 11:47:49", want))
+        self.assertEqual(D._iso("2026-09-21T11:47:49Z"), ("2026-09-21 11:47:49", want))
+        self.assertEqual(D._iso("2026-09-21T11:47:49.5+00:00")[0], "2026-09-21 11:47:49")
+
+    def test_no_offset_is_never_presented_as_utc(self):
+        self.assertEqual(D._iso("2026-09-21T17:17:49"), ("2026-09-21 17:17:49 (no zone)", None))
+        self.assertEqual(D._iso("2026-09-21T17:17:49.1234567"), ("2026-09-21 17:17:49 (no zone)", None))
+
+    def test_junk_and_empty(self):
+        self.assertEqual(D._iso(""), ("", None))
+        self.assertEqual(D._iso("not a time"), ("not a time", None))
+
+
+class PairingStatus(unittest.TestCase):
+    def test_each_state_is_told_apart(self):
+        msg = [("CREATE TABLE message (id INTEGER, timestamp INTEGER)", [])]
+        other = [("CREATE TABLE settings (k TEXT)", ["INSERT INTO settings VALUES ('x')"])]
+        folders = [(G[0], {}),
+                   (G[1], {"notes.txt": b"hello"}),
+                   (G[2], {"System/Database/phone.db": b"this is not a database at all, just bytes" * 4}),
+                   (G[3], {"System/Database/settings.db": other}),
+                   (G[4], {"System/Database/phone.db": msg}),
+                   (G[5], {"System/Database/phone.db": msg + [("CREATE TABLE conversation (id INTEGER)",
+                                                               ["INSERT INTO conversation VALUES (1)"])]})]
+        with tempfile.TemporaryDirectory() as tmp:
+            lc = make_pkg(tmp, folders=folders)
+            g = R.Graph()
+            _, pc = D.build(lc, g, R.View, R.ts_seconds, R.iso)
+            pc.close()
+        got = {r["DeviceFolder"]: r["Status"] for r in g.views["PC_devices"].rows}
+        self.assertEqual(got[G[0]], "folder only - its data was removed")
+        self.assertEqual(got[G[1]], "files present but no databases")
+        self.assertEqual(got[G[2]], "unreadable database")
+        self.assertEqual(got[G[3]], "data in other tables")
+        self.assertEqual(got[G[4]], "databases present but empty")
+        self.assertEqual(got[G[5]], "data present")
+
+
+class BadSources(unittest.TestCase):
+    META = {"DeviceMetadatas": {"HW1": [{"IsLinked": True, "Metadata": {"Id": "id-1", "Metadata": {"DisplayName": "P1"}}}]}}
+    TRUST = {"TrustedClients": {"id-1": {"PartnerClientId": "pre_id-1", "TrustType": 3}}}
+    OK_FOLDER = (G[0], {"System/Database/phone.db": [("CREATE TABLE message (id INTEGER, timestamp INTEGER)",
+                                                      ["INSERT INTO message VALUES (1, 5)"])]})
+
+    def build(self, **kw):
+        with WorkFolders(), tempfile.TemporaryDirectory() as tmp:
+            lc = make_pkg(tmp, folders=kw.pop("folders", [self.OK_FOLDER]), **kw)
+            g = R.Graph()
+            _, pc = D.build(lc, g, R.View, R.ts_seconds, R.iso)
+            pc.close()
+            return g
+
+    def assert_error_row(self, g, vid):
+        self.assertTrue(any(r.get("Error") or "could not read" in str(r.get("Note", "")) for r in g.views[vid].rows),
+                        g.views[vid].rows)
+
+    def test_corrupt_fulltrust_db(self):
+        g = self.build(meta=self.META, trust=self.TRUST,
+                       folders=[self.OK_FOLDER, ("FullTrust", {"phone_apps.db": b"garbage" * 30})])
+        self.assert_error_row(g, "PC_streamed")
+        self.assertEqual(len(g.views["PC_devices"].rows), 1)
+        self.assertEqual(len(g.views["PC_phones"].rows), 1)
+        self.assertEqual(len(g.views["PC_trust"].rows), 1)
+
+    def test_device_metadatas_list_shape(self):
+        g = self.build(meta={"DeviceMetadatas": [{"HW1": []}]}, trust=self.TRUST)
+        self.assert_error_row(g, "PC_phones")
+        self.assertEqual(len(g.views["PC_trust"].rows), 1)
+        self.assertEqual(len(g.views["PC_devices"].rows), 1)
+
+    def test_one_odd_entry_does_not_hide_the_others(self):
+        meta = {"DeviceMetadatas": {"BAD": {"not": "a list"}, **self.META["DeviceMetadatas"]}}
+        g = self.build(meta=meta, trust=self.TRUST)
+        notes = {r["HardwareID"]: r for r in g.views["PC_phones"].rows}
+        self.assertIn("could not read", notes["BAD"]["Note"])
+        self.assertEqual(notes["HW1"]["DisplayName"], "P1")
+
+    def test_truncated_json(self):
+        full = json.dumps(self.META)
+        g = self.build(meta=full[:len(full) // 2], trust=json.dumps(self.TRUST)[:20])
+        self.assert_error_row(g, "PC_phones")
+        self.assert_error_row(g, "PC_trust")
+        self.assertEqual(len(g.views["PC_devices"].rows), 1)
+        self.assertIn("PC_copies", g.views)
+
+    def test_package_copy_closed_when_build_fails(self):
+        with WorkFolders() as w, tempfile.TemporaryDirectory() as tmp:
+            lc = make_pkg(tmp, meta=self.META, folders=[self.OK_FOLDER])
+            with mock.patch.object(D, "_db_summary", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    D.build(lc, R.Graph(), R.View, R.ts_seconds, R.iso)
+            self.assertEqual(w.left(), [])
+
+    def test_package_copy_init_removes_work_folder_when_copy_fails(self):
+        with WorkFolders() as w, tempfile.TemporaryDirectory() as tmp:
+            lc = make_pkg(tmp, meta=self.META, trust=self.TRUST, folders=[self.OK_FOLDER])
+            real = D.shutil.copy2
+            calls = []
+
+            def flaky(a, b, *x, **k):
+                calls.append(a)
+                if len(calls) == 3:
+                    raise OSError("disk full")
+                return real(a, b, *x, **k)
+
+            with mock.patch.object(D.shutil, "copy2", flaky):
+                with self.assertRaises(OSError):
+                    D.PackageCopy(lc)
+            self.assertGreaterEqual(len(calls), 3)
+            self.assertEqual(w.left(), [])
+
+
+class Links(unittest.TestCase):
+    def link(self, target, link):
+        try:
+            import _winapi
+            _winapi.CreateJunction(target, link)
+            return
+        except (ImportError, AttributeError, OSError):
+            pass
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("neither a junction nor a symlink can be made here")
+
+    def test_junctions_and_symlinks_are_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside")
+            os.makedirs(outside)
+            with open(os.path.join(outside, "secret.db"), "wb") as f:
+                f.write(b"outside the package")
+            ok = (G[0], {"System/Database/phone.db": [("CREATE TABLE message (id INTEGER)", [])]})
+            lc = make_pkg(tmp, folders=[ok])
+            self.link(outside, os.path.join(lc, "Indexed", G[0], "linked"))     # a link inside a pairing folder
+            self.link(outside, os.path.join(lc, "Indexed", G[1]))              # a pairing folder that is a link
+            with WorkFolders():
+                g = R.Graph()
+                _, pc = D.build(lc, g, R.View, R.ts_seconds, R.iso)
+                try:
+                    copied = [os.path.join(r, f) for r, _, fs in os.walk(pc.work) for f in fs]
+                    self.assertFalse([c for c in copied if "secret" in c], copied)
+                    self.assertEqual([r["DeviceFolder"] for r in g.views["PC_devices"].rows], [G[0]])
+                    report = " | ".join(f"{r['file']} {r['copy_matches']}" for r in g.views["PC_copies"].rows)
+                    self.assertIn("linked", report)
+                    self.assertIn(G[1], report)
+                    self.assertIn("not followed", report)
+                finally:
+                    pc.close()
+            self.assertTrue(os.path.isfile(os.path.join(outside, "secret.db")))   # the target is untouched
+
+
+class TrustMatch(unittest.TestCase):
+    def test_partner_id_must_end_with_underscore_and_id(self):
+        meta = {"DeviceMetadatas": {"HW1": [{"Metadata": {"Id": "abc", "Metadata": {"DisplayName": "P1"}}}],
+                                    "HW2": [{"Metadata": {"Id": "a_b_c", "Metadata": {"DisplayName": "P2"}}}]}}
+        trust = {"TrustedClients": {"t1": {"PartnerClientId": "pre_a_b_c"},      # id contains '_'
+                                    "t2": {"PartnerClientId": "pre_xabc"}}}      # only ends with the same letters
+        with tempfile.TemporaryDirectory() as tmp:
+            lc = make_pkg(tmp, meta=meta, trust=trust)
+            g = R.Graph()
+            _, pc = D.build(lc, g, R.View, R.ts_seconds, R.iso)
+            pc.close()
+        self.assertEqual([t for rid, t, _ in g.links(("phone", "a_b_c")) if rid == "PR1"], [("trust", "t1")])
+        self.assertEqual([t for rid, t, _ in g.links(("phone", "abc")) if rid == "PR1"], [])
 
 
 class LinkedPhones(unittest.TestCase):
