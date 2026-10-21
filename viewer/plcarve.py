@@ -191,6 +191,21 @@ def wal_frames(path, ps):
 
 
 # ------------------------------------------------------------------ carving
+def _ro(path):
+    import plparse                  # imported late: plparse imports this module
+    return plparse.ro_uri(path)
+
+
+def local_payload(usable, p):
+    """Bytes of a table-leaf cell's payload kept on the page itself (the rest is on overflow pages)."""
+    x = usable - 35
+    if p <= x:
+        return p
+    m = ((usable - 12) * 32 // 255) - 23
+    k = m + ((p - m) % (usable - 4))
+    return k if k <= x else m
+
+
 PLUMBING = {"_change_notifications", "content_sequence"}
 
 
@@ -218,28 +233,44 @@ def type_fits(serial, aff):
     return True
 
 
-def table_shapes(db_path, include_plumbing=False):
+def table_shapes(db_path, include_plumbing=False, errors=None):
     """Column names AND affinities per table, straight from the live schema."""
     shapes = {}
+    c = None
     try:
-        c = sqlite3.connect("file:" + db_path.replace("\\", "/") + "?mode=ro", uri=True)
-        for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type='table'"):
-            if name.startswith("sqlite_") or name.startswith("fts_"):
-                continue
-            info = list(c.execute('PRAGMA table_info("%s")' % name))
-            if info:
-                shapes.setdefault(len(info), []).append(
-                    (name, [r[1] for r in info], [affinity(r[2]) for r in info]))
-        c.close()
-    except sqlite3.Error:
-        pass
+        c = sqlite3.connect(_ro(db_path), uri=True)
+        c.text_factory = bytes             # a corrupt name must not abort the whole listing
+        names = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    except Exception as e:
+        if errors is not None:
+            errors.append("schema: %s: %s" % (type(e).__name__, e))
+        names = []
+    try:
+        for raw in names:
+            try:
+                name = raw.decode("utf-8")
+                if name.startswith("sqlite_") or name.startswith("fts_"):
+                    continue
+                info = list(c.execute('PRAGMA table_info("%s")' % name.replace('"', '""')))
+                if info:
+                    dec = lambda b: b.decode("utf-8", "replace") if b else ""
+                    shapes.setdefault(len(info), []).append(
+                        (name, [dec(r[1]) for r in info], [affinity(dec(r[2])) for r in info]))
+            except Exception as e:
+                if errors is not None:
+                    errors.append("table %r: %s: %s" % (raw.decode("utf-8", "replace"), type(e).__name__, e))
+    finally:
+        if c is not None:
+            c.close()
     return shapes
 
 
-def carve_region(buf, start, length, shapes, ps, src, pno, kind, min_text=1):
+def carve_region(buf, start, length, shapes, ps, src, pno, kind, min_text=1, usable=None):
     """Scan one dead-space region for records whose self-description is consistent."""
     out = []
+    usable = usable or ps
     end = min(start + length, len(buf))
+    page_end = (start // ps + 1) * ps       # a cell never crosses its own page
     i = start
     while i < end:
         psz, o1 = varint(buf, i)
@@ -251,7 +282,9 @@ def carve_region(buf, start, length, shapes, ps, src, pno, kind, min_text=1):
             i += 1
             continue
         hsz, o3 = varint(buf, o2)
-        if hsz is None or hsz < 2 or hsz > psz or o2 + psz > len(buf):
+        # Only the local part of the payload is on this page; the rest of an overflowing value is elsewhere.
+        local = local_payload(usable, psz)
+        if hsz is None or hsz < 2 or hsz > psz or hsz > local or o2 + local > min(len(buf), page_end):
             i += 1
             continue
         # decode the serial-type array
@@ -275,10 +308,18 @@ def carve_region(buf, start, length, shapes, ps, src, pno, kind, min_text=1):
         if not cand:
             i += 1
             continue
-        vals, q = [], o2 + hsz
+        vals, q, lost = [], o2 + hsz, False
+        lim = o2 + local
         for t in types:
-            v, q = decode_value(buf, q, t)
-            vals.append(v)
+            ln = serial_len(t)
+            if not lost and q + ln <= lim:
+                v, q = decode_value(buf, q, t)
+                vals.append(v)
+                continue
+            # past the local payload: keep a cut-off text/blob, never read another page's bytes
+            raw = buf[q:lim] if not lost and t >= 12 else b""
+            vals.append(None if not raw else (raw.decode("utf-8", "replace") if t % 2 else bytes(raw)))
+            lost, q = True, lim
         texts = [v for v in vals if isinstance(v, str) and v.strip()]
         if len(texts) < min_text:
             i += 1
@@ -298,6 +339,8 @@ def carve_region(buf, start, length, shapes, ps, src, pno, kind, min_text=1):
                "candidates": "|".join("%s:%.2f" % (n, f) for f, n, _ in scored[:3]),
                "source_file": src, "page": pno, "region": kind,
                "offset": i, "rowid": rowid, "cols": len(types)}
+        if lost:
+            rec["overflow_lost"] = "yes"      # the value continues on overflow pages that are not read here
         for cn, v in zip(cols, vals):
             if isinstance(v, bytes):
                 rec[cn] = "<blob %d bytes>" % len(v)
@@ -306,18 +349,22 @@ def carve_region(buf, start, length, shapes, ps, src, pno, kind, min_text=1):
             else:
                 rec[cn] = v
         out.append(rec)
-        i = o2 + psz
+        i = o2 + local + (4 if local < psz else 0)    # skip the cell, incl. its overflow pointer
     return out
 
 
-def live_rowids(db_path, table):
+def live_rowids(db_path, table, errors=None):
+    c = None
     try:
-        c = sqlite3.connect("file:" + db_path.replace("\\", "/") + "?mode=ro", uri=True)
-        ids = {r[0] for r in c.execute('SELECT rowid FROM "%s"' % table)}
-        c.close()
-        return ids
-    except sqlite3.Error:
+        c = sqlite3.connect(_ro(db_path), uri=True)
+        return {r[0] for r in c.execute('SELECT rowid FROM "%s"' % table.replace('"', '""'))}
+    except Exception as e:
+        if errors is not None:
+            errors.append("live rows of %r: %s: %s" % (table, type(e).__name__, e))
         return set()
+    finally:
+        if c is not None:
+            c.close()
 
 
 def carve_db(db_path, include_wal=True, min_text=1, include_plumbing=False):
@@ -326,10 +373,12 @@ def carve_db(db_path, include_wal=True, min_text=1, include_plumbing=False):
         data = fh.read()
     ps = db_page_size(data)
     stats = {"file": os.path.basename(db_path), "page_size": ps,
-             "pages": 0, "free_pages": 0, "regions": 0, "wal_frames": 0, "records": 0}
+             "pages": 0, "free_pages": 0, "regions": 0, "wal_frames": 0, "records": 0,
+             "errors": []}
     if not ps:
         return ([], stats)
-    shapes = table_shapes(db_path)   # match against ALL tables, incl. plumbing
+    usable = ps - data[20]           # reserved bytes at the end of each page are not cell space
+    shapes = table_shapes(db_path, errors=stats["errors"])   # match against ALL tables, incl. plumbing
     npages = len(data) // ps
     fl = free_pages(data, ps)
     stats["pages"], stats["free_pages"] = npages, len(fl)
@@ -339,7 +388,7 @@ def carve_db(db_path, include_wal=True, min_text=1, include_plumbing=False):
         for kind, off, ln in page_regions(data, ps, pno, fl):
             stats["regions"] += 1
             recs += carve_region(data, off, ln, shapes, ps,
-                                 os.path.basename(db_path), pno, kind, min_text)
+                                 os.path.basename(db_path), pno, kind, min_text, usable)
 
     if include_wal:
         wp = db_path + "-wal"
@@ -351,7 +400,7 @@ def carve_db(db_path, include_wal=True, min_text=1, include_plumbing=False):
             hdr_off = 100 if pno == 1 else 0
             for kind, off, ln in page_regions(page, ps, 1, set(), hdr_offset=hdr_off):
                 recs += carve_region(page, off, ln, shapes, ps,
-                                     os.path.basename(wp), pno, "wal-" + kind, min_text)
+                                     os.path.basename(wp), pno, "wal-" + kind, min_text, usable)
 
     # Plumbing tables are matched (so their records are not mislabelled as some
     # other table of the same width) but dropped here unless explicitly wanted.
@@ -369,7 +418,7 @@ def carve_db(db_path, include_wal=True, min_text=1, include_plumbing=False):
         seen.add(key)
         t = r["table"]
         if t not in live_cache:
-            live_cache[t] = live_rowids(db_path, t)
+            live_cache[t] = live_rowids(db_path, t, stats["errors"])
         r["status"] = "also_live" if r["rowid"] in live_cache[t] else "deleted_or_overwritten"
         uniq.append(r)
     stats["records"] = len(uniq)

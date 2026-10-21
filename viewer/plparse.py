@@ -28,7 +28,7 @@ Design notes that matter forensically:
 Stdlib only. Read-only with respect to the evidence.
 """
 
-import argparse, csv, hashlib, html, json, os, re, shutil, sqlite3, sys, tempfile
+import argparse, csv, hashlib, html, json, os, pathlib, re, shutil, sqlite3, sys, tempfile
 try:
     import plcarve
 except ImportError:
@@ -167,8 +167,31 @@ def sha256(path):
     return h.hexdigest()
 
 
+def ro_uri(path):
+    """SQLite read-only URI for a path. Escapes '#', '%', '?' and spaces so any folder name opens correctly."""
+    return pathlib.Path(path).resolve().as_uri() + "?mode=ro"
+
+
+SNAPSHOT_TRIES = 3
+UNSTABLE = "NO - source changed during copy"
+
+
+def _source_state(src):
+    """Hashes of the source .db and -wal. The -shm is a shared-memory index and is left out."""
+    w = src + "-wal"
+    return (sha256(src), sha256(w) if os.path.isfile(w) else "")
+
+
 def stage(src_dir, work, acq):
-    """Copy every .db WITH its -wal/-shm. Report what was and was not found."""
+    """
+    Copy every .db WITH its -wal/-shm. Report what was and was not found.
+
+    A live database can change while its three files are copied one after another, which
+    would give a .db and a -wal from different moments. The .db and -wal are hashed before
+    and after each set; if either changed the whole set is copied again (3 tries). A set
+    that never settles is kept, and its row says so: source_stable = UNSTABLE, and the
+    recorded hashes are those of the copy actually taken.
+    """
     os.makedirs(work, exist_ok=True)
     staged = {}
     for name in DB_NAMES:
@@ -176,20 +199,34 @@ def stage(src_dir, work, acq):
         if not os.path.isfile(src):
             acq.append({"file": name, "status": "absent"})
             continue
-        row = {"file": name, "status": "copied",
-               "bytes": os.path.getsize(src), "sha256": sha256(src),
-               "wal": "", "shm": "", "wal_sha256": "", "shm_sha256": ""}
-        shutil.copy2(src, os.path.join(work, name))
+        dst = os.path.join(work, name)
+        stable = False
+        for _ in range(SNAPSHOT_TRIES):
+            before = _source_state(src)
+            shutil.copy2(src, dst)
+            for suf in ("-wal", "-shm"):
+                if os.path.isfile(src + suf):
+                    shutil.copy2(src + suf, dst + suf)
+                elif os.path.isfile(dst + suf):
+                    os.remove(dst + suf)         # left over from an earlier try
+            if _source_state(src) == before:
+                stable = True
+                break
+        row = {"file": name, "status": "copied", "bytes": os.path.getsize(dst),
+               "sha256": before[0] if stable else sha256(dst),
+               "wal": "", "shm": "", "wal_sha256": "", "shm_sha256": "",
+               "source_stable": "yes" if stable else UNSTABLE}
         for suf in ("-wal", "-shm"):
-            s = src + suf
-            if os.path.isfile(s):
-                shutil.copy2(s, os.path.join(work, name + suf))
-                k = "wal" if suf == "-wal" else "shm"
-                row[k] = os.path.getsize(s)
+            if os.path.isfile(dst + suf):
+                k = suf[1:]
+                row[k] = os.path.getsize(dst + suf)
                 # The WAL can hold most of the evidence, so it needs a hash too.
-                row[k + "_sha256"] = sha256(s)
+                if suf == "-wal":
+                    row[k + "_sha256"] = before[1] if stable else sha256(dst + suf)
+                else:
+                    row[k + "_sha256"] = sha256(src + suf) if stable else sha256(dst + suf)
         acq.append(row)
-        staged[name] = os.path.join(work, name)
+        staged[name] = dst
     return staged
 
 
@@ -212,7 +249,7 @@ def deleted_evidence(path, dbname):
     APP_ASSIGNED = 10 ** 12          # beyond any plausible insert counter here
     out = []
     try:
-        c = sqlite3.connect("file:" + path.replace("\\", "/") + "?mode=ro", uri=True)
+        c = sqlite3.connect(ro_uri(path), uri=True)
         try:
             seqs = c.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
         except sqlite3.Error:
@@ -251,7 +288,7 @@ def db_health(path):
     """PRAGMAs that decide whether the evidence is complete and carvable."""
     out = {}
     try:
-        c = sqlite3.connect("file:" + path.replace("\\", "/") + "?mode=ro", uri=True)
+        c = sqlite3.connect(ro_uri(path), uri=True)
         for p in ("journal_mode", "page_count", "freelist_count", "page_size", "secure_delete"):
             try:
                 out[p] = c.execute("PRAGMA " + p).fetchone()[0]
@@ -279,7 +316,7 @@ def q(path, sql, params=()):
                              "error": "file not present"})
         return []
     try:
-        c = sqlite3.connect("file:" + path.replace("\\", "/") + "?mode=ro", uri=True)
+        c = sqlite3.connect(ro_uri(path), uri=True)
         c.row_factory = sqlite3.Row
         try:
             rows = [dict(r) for r in c.execute(sql, params)]

@@ -97,27 +97,36 @@ class Evidence:
         self.src = os.path.abspath(src_dir)
         self.work = work or tempfile.mkdtemp(prefix="plrelate-")
         self.acq = []
-        self.paths = P.stage(self.src, self.work, self.acq)
         self.verify = []
-        for row in self.acq:
-            if row.get("status") != "copied":
-                continue
-            for suffix, key in (("", "sha256"), ("-wal", "wal_sha256"), ("-shm", "shm_sha256")):
-                if row.get(key):
-                    copy = os.path.join(self.work, row["file"] + suffix)
-                    ok = P.sha256(copy) == row[key]
-                    self.verify.append({"file": row["file"] + suffix, "source_sha256": row[key],
-                                        "copy_matches": "yes" if ok else "NO"})
-        if any(v["copy_matches"] != "yes" for v in self.verify):
-            shutil.rmtree(self.work, ignore_errors=True)  # do not leave a bad copy behind
-            raise IOError("a staged copy does not match its source hash")
+        self.snapshot_note = ""
         self._con = {}
+        try:
+            self.paths = P.stage(self.src, self.work, self.acq)
+            for row in self.acq:
+                if row.get("status") != "copied":
+                    continue
+                for suffix, key in (("", "sha256"), ("-wal", "wal_sha256"), ("-shm", "shm_sha256")):
+                    if row.get(key):
+                        copy = os.path.join(self.work, row["file"] + suffix)
+                        ok = P.sha256(copy) == row[key]
+                        self.verify.append({"file": row["file"] + suffix, "source_sha256": row[key],
+                                            "copy_matches": "yes" if ok else "NO",
+                                            "source_stable": row.get("source_stable", "yes")})
+            if any(v["copy_matches"] != "yes" for v in self.verify):
+                raise IOError("a staged copy does not match its source hash")
+        except BaseException:
+            shutil.rmtree(self.work, ignore_errors=True)  # do not leave a bad or partial copy behind
+            raise
+        moving = [r["file"] for r in self.acq if r.get("source_stable", "yes") != "yes"]
+        if moving:
+            self.snapshot_note = ("The source changed while it was being copied: %s. The copy may mix two moments "
+                                  "and some recent rows may be missing or inconsistent." % ", ".join(moving))
 
     def con(self, db):
         if db not in self.paths:
             return None
         if db not in self._con:
-            c = sqlite3.connect("file:" + self.paths[db].replace("\\", "/") + "?mode=ro", uri=True)
+            c = sqlite3.connect(P.ro_uri(self.paths[db]), uri=True)
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA query_only = ON")
             self._con[db] = c

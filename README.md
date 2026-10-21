@@ -106,7 +106,7 @@ That folder holds `phone.db` (SMS, MMS, RCS), `calling.db` (calls), `contacts.db
 - **Copies only.** The input folder is copied to a temporary folder first: every `.db` with its `-wal` and `-shm`, plus the package files for *Linked phones*.
 - **Every copy is re-hashed (SHA-256) against its source.** A mismatch stops the load, and the bad copy is removed.
 - **Read-only.** Copies are opened with SQLite `mode=ro` and `query_only`. The source folder is never opened by SQLite.
-- **Deleted rows are carved from the copy** (`plcarve.py`): free pages, freeblocks, page slack and WAL frames.
+- **Deleted rows are carved from the copy** (`plcarve.py`): free pages, freeblocks, page slack and WAL frames. A record is recoverable only while its header survives, and a typical single-row delete overwrites it, so most recoveries come from whole free pages, page slack and WAL frames.
 - **Cleanup.** Copies are deleted when the window closes. If a copy cannot be removed, the viewer says so and shows the path. On start it reports copy folders left by earlier runs.
 - **Secrets are never read.** Not read: the Bluetooth link keys, `PlatformEncryptedKeyStorage.json` and certificate bodies (only counted).
 - **Read-only access to the live PC.** The cable / Bluetooth section reads the live registry and logs, and changes nothing.

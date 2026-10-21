@@ -18,6 +18,8 @@ jobs:
         run: python tests/run_tests.py --upstream-maps upstream/SQLMap/Maps
       - name: Viewer relation tests
         run: python viewer/test_plrelate.py
+      - name: Evidence integrity and carving tests
+        run: python viewer/test_plevidence.py
       - name: Linked-phones tests
         run: python viewer/test_pldevices.py
       - name: Cable / Bluetooth connection tests
