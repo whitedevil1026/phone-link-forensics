@@ -107,8 +107,9 @@ def _is_link(path):
         st = os.lstat(path)
     except OSError:
         return False
-    isj = getattr(os.path, "isjunction", None)
-    return stat.S_ISLNK(st.st_mode) or bool(isj and isj(path))
+    isj = getattr(os.path, "isjunction", None)   # 3.12+; older Pythons rely on the reparse-point attribute
+    reparse = getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(st.st_mode) or bool(reparse) or bool(isj and isj(path))
 
 
 class PackageCopy:
@@ -342,13 +343,14 @@ def _build(pc, g, View, ts_seconds, iso):
                     m = x.get("Metadata") or {}
                     inner = m.get("Metadata") or {}
                     reg, reg_ts = _iso(m.get("RegitrationTime") or m.get("RegistrationTime"))  # Microsoft's spelling
-                    seen, _ = _iso(m.get("LastSeenTime"))
+                    seen, seen_ts = _iso(m.get("LastSeenTime"))
                     e = ("phone", m.get("Id") or hw)
                     mids[m.get("Id")] = e
                     g.label[e] = f"phone {inner.get('DisplayName') or inner.get('ModelName') or hw}"
                     g.time[e] = reg_ts
                     meta_rows.append({
-                        "_e": e, "_reg_ts": reg_ts, "HardwareID": hw, "Linked": "yes" if x.get("IsLinked") else "no",
+                        "_e": e, "_reg_ts": reg_ts, "_seen_ts": seen_ts, "HardwareID": hw,
+                        "Linked": "yes" if x.get("IsLinked") else "no",
                         "DisplayName": inner.get("DisplayName"), "Manufacturer": inner.get("Manufacture"),
                         "Model": inner.get("ModelName"), "ModelVersion": inner.get("ModelVersion"),
                         "OS": " ".join(str(v) for v in (inner.get("OsName"), inner.get("OsVersion")) if v),
@@ -455,7 +457,7 @@ def _build(pc, g, View, ts_seconds, iso):
         if m.get("RegisteredUTC"):
             events.append((m.get("_reg_ts"), "phone registered (metadata)", g.label[m["_e"]], m["_e"]))
         if m.get("LastSeenUTC"):
-            events.append((_iso(m["LastSeenUTC"])[1], "phone last seen (metadata)", g.label[m["_e"]], m["_e"]))
+            events.append((m.get("_seen_ts"), "phone last seen (metadata)", g.label[m["_e"]], m["_e"]))
     for t in trust_rows:
         events.append((g.time.get(t["_e"]), "trust relationship last used", g.label[t["_e"]], t["_e"]))
     rows = [{"_e": e, "TimeUTC": _utc_ts(ts) if ts is not None else "", "Event": what, "Detail": detail}

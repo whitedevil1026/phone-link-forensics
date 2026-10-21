@@ -7,8 +7,10 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -248,6 +250,32 @@ class TrustMatch(unittest.TestCase):
             pc.close()
         self.assertEqual([t for rid, t, _ in g.links(("phone", "a_b_c")) if rid == "PR1"], [("trust", "t1")])
         self.assertEqual([t for rid, t, _ in g.links(("phone", "abc")) if rid == "PR1"], [])
+
+
+class LastSeenInHistory(unittest.TestCase):
+    def test_last_seen_event_is_in_the_history_with_its_utc_time(self):
+        meta = {"DeviceMetadatas": {"HW1": [{"Metadata": {
+            "Id": "id-1", "RegistrationTime": "2026-09-21T17:00:00+05:30",
+            "LastSeenTime": "2026-09-21T17:17:49+05:30", "Metadata": {"DisplayName": "P1"}}}]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            lc = make_pkg(tmp, meta=meta)
+            g = R.Graph()
+            _, pc = D.build(lc, g, R.View, R.ts_seconds, R.iso)
+            pc.close()
+        self.assertEqual(g.views["PC_phones"].rows[0]["LastSeenUTC"], "2026-09-21 11:47:49")
+        seen = [r["TimeUTC"] for r in g.views["PR4"].rows if r["Event"] == "phone last seen (metadata)"]
+        self.assertEqual(seen, ["2026-09-21 11:47:49"])
+
+
+class LinkDetection(unittest.TestCase):
+    def test_reparse_point_attribute_is_a_link_even_without_isjunction(self):
+        # Python 3.8-3.11 has no os.path.isjunction and lstat does not flag junctions: the attribute must
+        fake = types.SimpleNamespace(st_mode=0o040000, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        plain = types.SimpleNamespace(st_mode=0o040000, st_file_attributes=stat.FILE_ATTRIBUTE_DIRECTORY)
+        with mock.patch.object(D.os, "lstat", return_value=fake),                 mock.patch.object(D.os.path, "isjunction", None, create=True):
+            self.assertTrue(D._is_link("x"))
+        with mock.patch.object(D.os, "lstat", return_value=plain),                 mock.patch.object(D.os.path, "isjunction", None, create=True):
+            self.assertFalse(D._is_link("x"))
 
 
 class LinkedPhones(unittest.TestCase):
