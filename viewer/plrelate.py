@@ -67,17 +67,28 @@ def ts_seconds(v):
     """Unix seconds (float) from a raw Phone Link time, by the same magnitude rules as plparse.conv_time."""
     try:
         v = int(v)
-    except (TypeError, ValueError):
-        return None
-    if v <= 0:
-        return None
-    if v > 10 ** 16:
-        return v / 1e7 - 11644473600
-    if v > 10 ** 11:
-        return v / 1e3
-    if v > 10 ** 8:
-        return float(v)
+        if v <= 0:
+            return None
+        if v > 10 ** 16:
+            return v / 1e7 - 11644473600
+        if v > 10 ** 11:
+            return v / 1e3
+        if v > 10 ** 8:
+            return float(v)
+    except (TypeError, ValueError, OverflowError):   # text, NULL, inf, or a number too big for a float
+        pass
     return None
+
+
+def whole(v):
+    """int from a stored value, or None when it is NULL, text or anything else that is not a number."""
+    try:
+        return int(v)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def iso(sec):
@@ -100,6 +111,8 @@ class Evidence:
         self.verify = []
         self.snapshot_note = ""
         self._con = {}
+        self._cols = {}
+        self.missing = {}       # (db, table) -> columns the viewer asked for that this copy does not have
         try:
             self.paths = P.stage(self.src, self.work, self.acq)
             for row in self.acq:
@@ -141,6 +154,40 @@ class Evidence:
         if not all(self.has(db, t) for t in tables):
             return []
         return [dict(r) for r in self.con(db).execute(sql)]
+
+    def columns(self, db, table):
+        """Column names of a table, [] when the database or table is absent."""
+        if (db, table) not in self._cols:
+            c = self.con(db)
+            self._cols[(db, table)] = [r[1] for r in c.execute(f'PRAGMA table_info("{table}")')] if c else []
+        return self._cols[(db, table)]
+
+    def table(self, db, table, cols, order=()):
+        """Rows as dicts holding every name in cols; a column this copy lacks comes back None and is recorded in
+        self.missing, so a schema variant blanks one field instead of stopping the build. [] when the table is absent.
+        order: column names (optionally 'name DESC') applied when the table has them."""
+        have = self.columns(db, table)
+        if not have:
+            return []
+        use = [c for c in cols if c in have or c == "rowid"]
+        lost = [c for c in cols if c not in use]
+        if lost:
+            self.missing.setdefault((db, table), set()).update(lost)
+        by = []
+        for o in order:
+            name, _, direction = o.partition(" ")
+            if name in have or name == "rowid":
+                by.append(f'"{name}" {direction}'.strip())
+        sql = "SELECT %s FROM \"%s\"" % (", ".join(f'"{c}"' for c in use) or "1", table)
+        if by:
+            sql += " ORDER BY " + ", ".join(by)
+        blank = dict.fromkeys(cols)
+        return [{**blank, **dict(zip(use, r))} for r in self.con(db).execute(sql)]
+
+    def missing_note(self, sources):
+        """Sentence naming the columns missing from the given (db, table) sources, '' when none."""
+        lost = sorted(f"{t}.{c}" for db, t in dict.fromkeys(sources) for c in self.missing.get((db, t), ()))
+        return (" - NOT IN THIS COPY of the database, so these fields are blank: " + ", ".join(lost)) if lost else ""
 
     def count(self, db, table):
         return self.con(db).execute(f'SELECT count(*) FROM "{table}"').fetchone()[0] if self.has(db, table) else None
@@ -205,15 +252,24 @@ def _ent(kind, key):
 
 # ---------------------------------------------------------------- contacts index
 def contact_index(ev):
-    """party key -> [(contact_id, display_name)] - every candidate, so shared numbers are visible."""
+    """party key -> [(contact_id, name)] - every candidate, so shared numbers are visible.
+    A contact without a name is 'contact <id>'. A number whose contact row no longer exists has no candidate
+    (R23 lists those details)."""
+    names = {c["contact_id"]: c["display_name"]
+             for c in ev.table("contacts.db", "contact", ("contact_id", "display_name"))}
+    known = ev.has("contacts.db", "contact")
     idx = defaultdict(list)
-    for r in ev.rows("contacts.db", """SELECT p.phone_number, p.display_phone_number, c.contact_id, c.display_name
-                                         FROM phonenumber p LEFT JOIN contact c ON c.contact_id = p.contact_id
-                                         ORDER BY p.rowid""", "phonenumber", "contact"):
+    for r in ev.table("contacts.db", "phonenumber", ("phone_number", "display_phone_number", "contact_id"),
+                      order=("rowid",)):
+        cid = r["contact_id"]
+        if known and cid not in names:
+            continue
+        name = names.get(cid)
+        cand = (cid, str(name) if name not in (None, "") else f"contact {cid}")
         for raw in (r["phone_number"], r["display_phone_number"]):
             k, kind, _ = P.norm_addr(raw, DIGITS)
-            if k and kind in ("phone", "short") and (r["contact_id"], r["display_name"]) not in idx[k]:
-                idx[k].append((r["contact_id"], r["display_name"] or ""))
+            if k and kind in ("phone", "short") and cand not in idx[k]:
+                idx[k].append(cand)
     return idx
 
 
@@ -223,16 +279,21 @@ def resolve(addr, idx):
     if kind == "rcs-agent":
         return k, kind, disp, [], "rcs-business-agent (name from the address)"
     cands = idx.get(k, []) if kind in ("phone", "short") else []
-    names = sorted({n for _, n in cands if n})
     if not cands:
         return k, kind, "", [], ""
     basis = f"contacts.db, last {DIGITS} digits"
-    if len(names) > 1:
-        basis += f" - AMBIGUOUS: {len(cands)} contacts share this number"
-    return k, kind, " | ".join(names), cands, basis
+    ids = {cid for cid, _ in cands}
+    if len(ids) > 1:   # by contact id: two contacts both called "Mum" are still two contacts
+        basis += f" - AMBIGUOUS: {len(ids)} contacts share this number"
+    return k, kind, " | ".join(sorted(n for _, n in cands)), cands, basis
 
 
 GROUP_SEP = P.GROUP_SEP  # same rule as plparse: commas, semicolons or 2+ spaces
+# contact satellite tables: (table, the column shown as the value)
+SATELLITES = (("phonenumber", "display_phone_number"), ("emailaddress", "address"),
+              ("postaladdress", "display_address"), ("contactdate", "display_date"), ("contacturl", "url_address"))
+R21_MAX_PER_EVENT = 50   # links one event gets in R21; a burst of n events would otherwise make n*n/2 pairs
+TIMED_KINDS = ("call", "sms", "mms", "photo", "notif", "handoff", "rcs_chat", "rcs_filetransfer")
 
 
 def split_recipients(recipient_list):
@@ -243,6 +304,101 @@ def split_recipients(recipient_list):
     return parts or [s]
 
 
+def view_sources(vid):
+    """(database, table) pairs a view is made from, to say which missing columns can blank its fields."""
+    def src(db, *tables):
+        return [(db, t) for t in tables]
+    ct, ph, nt = "contacts.db", "phone.db", "notifications.db"
+    contact = src(ct, "contact", *[t for t, _ in SATELLITES])
+    names = src(ct, "phonenumber", "contact")
+    calls, sms, threads = src("calling.db", "call_history"), src(ph, "message"), src(ph, "conversation")
+    part, mms, sims, rcs = src(ph, "participant"), src(ph, "mms"), src(ph, "subscription"), src(ph, "rcs_conversation")
+    rcs_rows = src(ph, "rcs_chat", "rcs_filetransfer")
+    photo, apps = src("photos.db", "media"), src("phoneapps.db", "phone_apps")
+    cont = src("continuity.db", "browser_history", "continue_app_context")
+    timeline = calls + sms + mms + photo + rcs_rows + src(nt, "notifications") + src("continuity.db", "continue_app_context")
+    table_of = {
+        "E_contacts": contact, "E_calls": calls, "E_threads": threads, "E_sms": sms, "E_mms": mms, "E_participants": part,
+        "E_rcs": rcs, "E_sims": sims, "E_photos": photo, "E_apps": apps, "E_recent": src("phoneapps.db", "recent_apps"),
+        "E_pcapp": src("phoneapps.db", "pcapp_data"), "E_browser": src("continuity.db", "browser_history"),
+        "E_handoff": src("continuity.db", "continue_app_context"), "E_settings": src("settings.db", "settings"),
+        "R01": contact, "R02": src(ct, "contact_index", "contact"), "R03": sms + threads, "R04": part + threads,
+        "R05": mms + src(ph, "mms_part"), "R06": rcs_rows + rcs, "R07": rcs + threads,
+        "R08": src(ph, "conversation_attribute"), "R09": src(ph, "sending_message") + sms,
+        "R10": sms + sims, "R11": apps + src("phoneapps.db", "recent_apps", "pcapp_data"),
+        "R13": calls + names, "R14": calls + sims, "R15": sms + names, "R16": threads + names, "R17": part + names,
+        "R18": calls + sms + threads + names,
+        "R19": src(nt, "notifications") + apps + src("settings.db", "settings") + cont,
+        "R20": calls + photo, "R21": timeline, "R22": timeline,
+        "R23": part + sms + threads + rcs + contact, "R24": calls + sms + threads + names + contact,
+        "R25": [(db, "content_sequence") for db in P.DB_NAMES],
+        "N_toasts": src(nt, "notification_toastmappings"), "N_requests": src(nt, "phone_requests"),
+        "ND1": src(nt, "notifications", "notification_toastmappings"),
+        "ND2": src(nt, "notifications", "phone_requests"),
+    }
+    if vid in table_of:
+        return table_of[vid]
+    return src(nt, "notifications") if vid.startswith(("N_", "NR", "ND")) else []
+
+
+def near_pairs(events, w, cap):
+    """Pairs (i, j), i < j, of events (sorted (time, entity)) at most w seconds apart, photo-photo pairs left out.
+    An event is in at most cap pairs; the nearest pairs win. Returns (pairs sorted, number left out by the cap).
+    Work is about n * cap, not n * n: a burst of thousands of events must not make millions of pairs."""
+    n = len(events)
+    times = [t for t, _ in events]
+    photo = [e[0] == "photo" for _, e in events]
+    non_photo = [i for i in range(n) if not photo[i]]
+    np_times = [times[i] for i in non_photo]
+
+    def nearest(i):
+        t = times[i]
+        if photo[i]:       # a photo pairs with non-photos only, so look in that list (the photo is not in it)
+            ids, ts = non_photo, np_times
+            lo = bisect.bisect_left(ts, t) - 1
+            hi = lo + 1
+        else:
+            ids, ts = range(n), times
+            lo, hi = i - 1, i + 1
+        out = []
+        while len(out) < cap:
+            before = t - ts[lo] if lo >= 0 and t - ts[lo] <= w else None
+            after = ts[hi] - t if hi < len(ts) and ts[hi] - t <= w else None
+            if before is None and after is None:
+                break
+            if after is None or (before is not None and before <= after):
+                out.append(ids[lo])
+                lo -= 1
+            else:
+                out.append(ids[hi])
+                hi += 1
+        return out
+
+    cand = set()
+    for i in range(n):
+        for j in nearest(i):
+            cand.add((min(i, j), max(i, j)))
+    used, kept = defaultdict(int), []
+    for i, j in sorted(cand, key=lambda ij: (times[ij[1]] - times[ij[0]], ij)):
+        if used[i] < cap and used[j] < cap:
+            used[i] += 1
+            used[j] += 1
+            kept.append((i, j))
+    # every pair inside the window, counted without listing them
+    photos_before = [0]
+    for is_photo in photo:
+        photos_before.append(photos_before[-1] + is_photo)
+    total = 0
+    for i in range(n):
+        end = bisect.bisect_right(times, times[i] + w)
+        while end < n and times[end] - times[i] <= w:
+            end += 1
+        while end > i + 1 and times[end - 1] - times[i] > w:
+            end -= 1
+        total += end - i - 1 - (photos_before[end] - photos_before[i + 1] if photo[i] else 0)
+    return sorted(kept), total - len(kept)
+
+
 # ---------------------------------------------------------------- build
 def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
     g = Graph()
@@ -250,14 +406,14 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
     add = g.add_view
 
     # ---------- entity views
-    contacts = ev.rows("contacts.db", """SELECT contact_id, display_name, nickname, company, job_title,
-                                                last_updated_time FROM contact ORDER BY display_name""", "contact")
+    T = ev.table   # rows as dicts; a column this copy lacks is None and is named in the view's basis
+    contacts = T("contacts.db", "contact", ("contact_id", "display_name", "company", "last_updated_time"),
+                 order=("display_name",))
+    contact_name = {c["contact_id"]: c["display_name"] for c in contacts}
     sat = defaultdict(lambda: defaultdict(list))
-    for table, col in (("phonenumber", "display_phone_number"), ("emailaddress", "address"),
-                       ("postaladdress", "display_address"), ("contactdate", "display_date"),
-                       ("contacturl", "url_address")):
-        for r in ev.rows("contacts.db", f"SELECT contact_id, {col} AS v FROM {table}", table):
-            sat[r["contact_id"]][table].append(str(r["v"] or ""))
+    for table, col in SATELLITES:
+        for r in T("contacts.db", table, ("contact_id", col)):
+            sat[r["contact_id"]][table].append(str(r[col] or ""))
     rows = []
     for c in contacts:
         e = _ent("contact", c["contact_id"])
@@ -269,7 +425,8 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
     add(View("E_contacts", "Contacts", "entity", "contacts.db contact + satellite tables",
              ["ContactID", "Name", "Company", "Numbers", "Emails", "LastUpdatedUTC"], rows), "_e")
 
-    calls = ev.rows("calling.db", "SELECT * FROM call_history ORDER BY start_time", "call_history")
+    calls = T("calling.db", "call_history", ("call_id", "start_time", "phone_number", "call_type", "duration",
+                                             "phone_account_id"), order=("start_time",))
     rows = []
     for c in calls:
         e = _ent("call", c["call_id"])
@@ -286,7 +443,8 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
              ["CallID", "StartUTC", "Type", "Number", "ContactName", "NameBasis", "DurationSec", "SIM"], rows), "_e")
     call_rows = rows
 
-    threads = ev.rows("phone.db", "SELECT * FROM conversation ORDER BY timestamp DESC", "conversation")
+    threads = T("phone.db", "conversation", ("thread_id", "recipient_list", "timestamp", "msg_count", "unread_count"),
+                order=("timestamp DESC",))
     rows = []
     for t in threads:
         e = _ent("thread", t["thread_id"])
@@ -303,7 +461,8 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
              ["ThreadID", "Recipients", "ContactNames", "Group", "LastUTC", "Messages", "Unread"], rows), "_e")
     thread_rows = rows
 
-    msgs = ev.rows("phone.db", "SELECT * FROM message ORDER BY timestamp", "message")
+    msgs = T("phone.db", "message", ("message_id", "thread_id", "from_address", "to_address", "type", "body",
+                                     "timestamp", "subscription_id"), order=("timestamp",))
     rows = []
     for m in msgs:
         e = _ent("sms", m["message_id"])
@@ -319,7 +478,8 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
         "_e")
     sms_rows = rows
 
-    mms = ev.rows("phone.db", "SELECT * FROM mms ORDER BY timestamp", "mms")
+    mms = T("phone.db", "mms", ("message_id", "thread_id", "timestamp", "from_address", "to_addresses", "subject",
+                                "subscription_id"), order=("timestamp",))
     rows = [{"_e": _ent("mms", m["message_id"]), "MessageID": m["message_id"], "ThreadID": m["thread_id"],
              "TimeUTC": iso(ts_seconds(m["timestamp"])), "From": m["from_address"], "To": m["to_addresses"],
              "Subject": m["subject"], "SIM": m["subscription_id"]} for m in mms]
@@ -329,7 +489,7 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
     add(View("E_mms", "MMS", "entity", "phone.db mms",
              ["MessageID", "ThreadID", "TimeUTC", "From", "To", "Subject", "SIM"], rows), "_e")
 
-    parts = ev.rows("phone.db", "SELECT * FROM participant", "participant")
+    parts = T("phone.db", "participant", ("id", "thread_id", "send_address", "normalized_address"))
     rows = []
     for p in parts:
         e = _ent("participant", p["id"])
@@ -342,7 +502,7 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
              ["ParticipantID", "ThreadID", "Address", "Normalized", "ContactName", "NameBasis"], rows), "_e")
     part_rows = rows
 
-    rcs = ev.rows("phone.db", "SELECT * FROM rcs_conversation", "rcs_conversation")
+    rcs = T("phone.db", "rcs_conversation", ("thread_id", "fallback_id", "recipient_list", "timestamp", "msg_count"))
     rows = [{"_e": _ent("rcsthread", r["thread_id"]), "RCSThreadID": r["thread_id"], "FallbackID": r["fallback_id"],
              "Recipients": r["recipient_list"], "LastUTC": iso(ts_seconds(r["timestamp"])), "Messages": r["msg_count"]}
             for r in rcs]
@@ -351,7 +511,7 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
     add(View("E_rcs", "RCS threads", "entity", "phone.db rcs_conversation",
              ["RCSThreadID", "FallbackID", "Recipients", "LastUTC", "Messages"], rows), "_e")
 
-    subs = ev.rows("phone.db", "SELECT * FROM subscription", "subscription")
+    subs = T("phone.db", "subscription", ("subscription_id", "sim_slot_index", "name", "number", "country_iso"))
     rows = [{"_e": _ent("sim", str(s["subscription_id"])), "SubscriptionID": s["subscription_id"],
              "Slot": s["sim_slot_index"], "Carrier": s["name"], "Number": s["number"], "Country": s["country_iso"]}
             for s in subs]
@@ -360,8 +520,8 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
     add(View("E_sims", "SIMs", "entity", "phone.db subscription",
              ["SubscriptionID", "Slot", "Carrier", "Number", "Country"], rows), "_e")
 
-    photos = ev.rows("photos.db", "SELECT id, name, taken_time, last_updated_time, size, mime_type, uri FROM media"
-                                  " ORDER BY taken_time", "media")
+    photos = T("photos.db", "media", ("id", "name", "taken_time", "last_updated_time", "size", "uri"),
+               order=("taken_time",))
     rows = []
     for p in photos:
         e = _ent("photo", p["id"])
@@ -373,8 +533,8 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
              ["MediaID", "Name", "TakenUTC", "SyncedUTC", "SizeBytes", "URI"], rows), "_e")
     photo_rows = rows
 
-    apps = ev.rows("phoneapps.db", "SELECT app_id, app_name, package_name, version, favorite_rank, last_updated_time"
-                                   " FROM phone_apps ORDER BY app_name", "phone_apps")
+    apps = T("phoneapps.db", "phone_apps", ("app_name", "package_name", "version", "favorite_rank",
+                                            "last_updated_time"), order=("app_name",))
     rows = []
     for a in apps:
         e = _ent("app", a["package_name"])
@@ -385,24 +545,21 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
              ["AppName", "Package", "Version", "FavoriteRank", "SyncedUTC"], rows), "_e")
 
     simple = [
-        ("E_recent", "Recent apps", "phoneapps.db", "recent_apps", "recentapp", "app_id",
-         "SELECT * FROM recent_apps ORDER BY recent_app_rank", ["app_id", "recent_app_rank", "app_name", "package_name",
-                                                               "intent_action", "task_id"]),
-        ("E_pcapp", "PC counterparts", "phoneapps.db", "pcapp_data", "pcapp", "id", "SELECT * FROM pcapp_data",
+        ("E_recent", "Recent apps", "phoneapps.db", "recent_apps", "recentapp", "app_id", ("recent_app_rank",),
+         ["app_id", "recent_app_rank", "app_name", "package_name", "intent_action", "task_id"]),
+        ("E_pcapp", "PC counterparts", "phoneapps.db", "pcapp_data", "pcapp", "id", (),
          ["id", "package_name", "is_installed", "platformapp_id", "platformapp_package", "platformapp_url"]),
         ("E_browser", "Phone browser history", "continuity.db", "browser_history", "browser", "browser_history_id",
-         "SELECT * FROM browser_history ORDER BY browser_history_rank",
+         ("browser_history_rank",),
          ["browser_history_id", "browser_history_rank", "browser_history_title", "web_uri", "package_name"]),
         ("E_handoff", "Cross-device handoff", "continuity.db", "continue_app_context", "handoff", "id",
-         "SELECT * FROM continue_app_context ORDER BY create_time",
-         ["id", "context_id", "app_id", "title", "web_link", "create_time"]),
-        ("E_settings", "App settings", "settings.db", "settings", "setting", "setting_key",
-         "SELECT * FROM settings", ["setting_group_id", "setting_key", "setting_type", "setting_value",
-                                    "setting_mute_expiration_timestamp"]),
+         ("create_time",), ["id", "context_id", "app_id", "title", "web_link", "create_time"]),
+        ("E_settings", "App settings", "settings.db", "settings", "setting", "setting_key", (),
+         ["setting_group_id", "setting_key", "setting_type", "setting_value", "setting_mute_expiration_timestamp"]),
     ]
     simple_rows = {}
-    for vid, title, db, table, kind, key, sql, cols in simple:
-        rs = ev.rows(db, sql, table)
+    for vid, title, db, table, kind, key, order, cols in simple:
+        rs = T(db, table, cols, order=order)
         rows = []
         for r in rs:
             e = _ent(kind, r[key])
@@ -412,9 +569,9 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
                 out[c] = iso(ts_seconds(v)) if c in ("post_time", "create_time") else v
             rows.append(out)
             g.label[e] = f"{title.lower()} {r.get('app_name') or r.get('title') or r.get('package_name') or r[key]}"
-            if "post_time" in r:
+            if "post_time" in cols:
                 g.time[e] = ts_seconds(r["post_time"])
-            if "create_time" in r:
+            if "create_time" in cols:
                 g.time[e] = ts_seconds(r["create_time"])
         simple_rows[vid] = (rs, rows)
         add(View(vid, title, "entity", f"{db} {table}", cols, rows), "_e")
@@ -429,22 +586,19 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
 
     # R01 contact -> satellite rows
     rows = []
-    for table, col in (("phonenumber", "display_phone_number"), ("emailaddress", "address"),
-                       ("postaladdress", "display_address"), ("contactdate", "display_date"),
-                       ("contacturl", "url_address")):
-        for r in ev.rows("contacts.db", f"SELECT t.contact_id, t.{col} AS v, c.display_name FROM {table} t"
-                                        f" LEFT JOIN contact c ON c.contact_id = t.contact_id", table, "contact"):
-            rows.append({"ContactID": r["contact_id"], "Contact": r["display_name"], "Table": table, "Value": r["v"]})
+    for table, col in SATELLITES:
+        for r in T("contacts.db", table, ("contact_id", col)):
+            rows.append({"ContactID": r["contact_id"], "Contact": contact_name.get(r["contact_id"]), "Table": table,
+                         "Value": r[col]})
     rel("R01", "Contact -> numbers, emails, addresses, dates, URLs", "schema",
         "contact_id in each satellite table = contact.contact_id (contacts.db)", ["ContactID", "Contact", "Table", "Value"],
         rows)
 
     # R02 deleted contact details (tombstones)
     rows = []
-    for r in ev.rows("contacts.db", "SELECT i.*, c.display_name FROM contact_index i LEFT JOIN contact c"
-                                    " ON c.contact_id = i.contact_id", "contact_index", "contact"):
-        rows.append({"ContactID": r["contact_id"], "Contact": r["display_name"], "DeletedFrom": r["foreign_table_name"],
-                     "DeletedRowID": r["foreign_id"]})
+    for r in T("contacts.db", "contact_index", ("contact_id", "foreign_table_name", "foreign_id")):
+        rows.append({"ContactID": r["contact_id"], "Contact": contact_name.get(r["contact_id"]),
+                     "DeletedFrom": r["foreign_table_name"], "DeletedRowID": r["foreign_id"]})
     rel("R02", "Deleted contact details (tombstones)", "schema",
         "contact_index rows written by BEFORE DELETE triggers on the satellite tables (contacts.db)",
         ["ContactID", "Contact", "DeletedFrom", "DeletedRowID"], rows)
@@ -467,21 +621,29 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
 
     # R05 thread -> MMS -> parts
     rows = []
-    for r in ev.rows("phone.db", "SELECT m.thread_id, m.message_id, p.part_id, p.content_type, p.name, p.size"
-                                 " FROM mms m LEFT JOIN mms_part p ON p.message_id = m.message_id", "mms", "mms_part"):
-        g.link("R05", _ent("thread", r["thread_id"]), _ent("mms", r["message_id"]))
-        rows.append({"ThreadID": r["thread_id"], "MMSID": r["message_id"], "PartID": r["part_id"],
-                     "ContentType": r["content_type"], "Name": r["name"], "Size": r["size"]})
+    mms_parts = defaultdict(list)
+    for p in T("phone.db", "mms_part", ("message_id", "part_id", "content_type", "name", "size")):
+        mms_parts[p["message_id"]].append(p)
+    for m in T("phone.db", "mms", ("thread_id", "message_id")):
+        g.link("R05", _ent("thread", m["thread_id"]), _ent("mms", m["message_id"]))
+        for r in mms_parts.get(m["message_id"]) or [{}]:    # a message without parts still gets its row
+            rows.append({"ThreadID": m["thread_id"], "MMSID": m["message_id"], "PartID": r.get("part_id"),
+                         "ContentType": r.get("content_type"), "Name": r.get("name"), "Size": r.get("size")})
     rel("R05", "SMS thread -> MMS -> attachments", "id-join",
         "mms.thread_id = conversation.thread_id; mms_part.message_id = mms.message_id (phone.db)",
         ["ThreadID", "MMSID", "PartID", "ContentType", "Name", "Size"], rows)
 
     # R06 RCS thread -> chats / file transfers
     rows = []
-    for table in ("rcs_chat", "rcs_filetransfer"):
-        for r in ev.rows("phone.db", f"SELECT thread_id, message_id, from_address, timestamp FROM {table}", table):
-            g.link("R06", _ent("rcsthread", r["thread_id"]), _ent(table, r["message_id"]))
-            rows.append({"RCSThreadID": r["thread_id"], "Table": table, "MessageID": r["message_id"],
+    for table, what in (("rcs_chat", "RCS chat"), ("rcs_filetransfer", "RCS file transfer")):
+        for r in T("phone.db", table, ("thread_id", "message_id", "from_address", "timestamp")):
+            e = _ent(table, r["message_id"])
+            g.link("R06", _ent("rcsthread", r["thread_id"]), e)
+            if e:   # a timed row of its own: it joins the timeline (R21, R22); its home is this row
+                g.time[e] = ts_seconds(r["timestamp"])
+                g.label[e] = f"{what} {r['from_address'] or ''}".strip()
+                g.home.setdefault(e, ("R06", len(rows)))
+            rows.append({"_e": e, "RCSThreadID": r["thread_id"], "Table": table, "MessageID": r["message_id"],
                          "From": r["from_address"], "TimeUTC": iso(ts_seconds(r["timestamp"]))})
     rel("R06", "RCS thread -> chats and file transfers", "id-join",
         "rcs_chat / rcs_filetransfer.thread_id = rcs_conversation.thread_id (phone.db)",
@@ -502,7 +664,8 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
 
     # R08 thread -> pin/mute/hide
     rows = []
-    for r in ev.rows("phone.db", "SELECT * FROM conversation_attribute", "conversation_attribute"):
+    for r in T("phone.db", "conversation_attribute", ("thread_id", "rcs_thread_id", "position", "is_muted",
+                                                       "is_hidden")):
         rows.append({"ThreadID": r["thread_id"], "RCSThreadID": r["rcs_thread_id"], "PinPosition": r["position"],
                      "Muted": r["is_muted"], "Hidden": r["is_hidden"]})
     rel("R08", "Thread -> pinned / muted / hidden state", "id-join",
@@ -511,7 +674,7 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
 
     # R09 outbound queue
     rows = []
-    for r in ev.rows("phone.db", "SELECT * FROM sending_message", "sending_message"):
+    for r in T("phone.db", "sending_message", ("id", "thread_id", "message_id", "message_kind", "result_code")):
         g.link("R09", _ent("thread", r["thread_id"]), _ent("sms", r["message_id"]))
         rows.append({"QueueID": r["id"], "ThreadID": r["thread_id"], "MessageID": r["message_id"],
                      "Kind": r["message_kind"], "ResultCode": r["result_code"]})
@@ -630,7 +793,7 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
             g.link("R18", e, _ent("contact", cid))
         times = [x for x in [g.time.get(c["_e"]) for c in p["calls"]] + [g.time.get(m["_e"]) for m in p["sms"]] if x]
         rows.append({"_e": e, "Party": p["disp"], "ContactName": " | ".join(sorted(p["names"])),
-                     "Calls": len(p["calls"]), "TalkSec": sum(int(c["_dur"] or 0) for c in p["calls"]),
+                     "Calls": len(p["calls"]), "TalkSec": sum(whole(c["_dur"]) or 0 for c in p["calls"]),
                      "SMS": len(p["sms"]), "Threads": len(p["threads"]),
                      "BothChannels": "yes" if p["calls"] and (p["sms"] or p["threads"]) else "",
                      "FirstUTC": iso(min(times)) if times else "", "LastUTC": iso(max(times)) if times else ""})
@@ -657,8 +820,8 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
         ["Source", "Package", "InstalledAppFound"], rows)
 
     # R20 photo taken during a call
-    timed_calls = [(g.time[c["_e"]], g.time[c["_e"]] + int(c["_dur"] or 0), c) for c in call_rows
-                   if g.time.get(c["_e"]) and int(c["_dur"] or 0) > 0]
+    timed_calls = [(g.time[c["_e"]], g.time[c["_e"]] + (whole(c["_dur"]) or 0), c) for c in call_rows
+                   if g.time.get(c["_e"]) and (whole(c["_dur"]) or 0) > 0]
     # sorted by start + bisect instead of photos x calls; candidates are put back in call order so the
     # output is the same as the plain double loop
     by_start = sorted(range(len(timed_calls)), key=lambda i: timed_calls[i][0])
@@ -681,45 +844,47 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
         ["MediaID", "Photo", "TakenUTC", "CallID", "CallStartUTC", "CallSec", "Party"], rows)
 
     # R21 events near each other ; R22 unified timeline
-    events = sorted(((t, e) for e, t in g.time.items() if t and e[0] in
-                     ("call", "sms", "mms", "photo", "notif", "handoff")), key=lambda x: x[0])
-    w = window_min * 60
-    rows, j = [], 0
-    for i, (t, e) in enumerate(events):
-        k = i + 1
-        while k < len(events) and events[k][0] - t <= w:
-            t2, e2 = events[k]
-            if e2[0] != e[0] or e[0] != "photo":   # skip photo-photo bursts, keep everything else
-                g.link("R21", e, e2, f"{int(t2 - t)} s apart")
-                rows.append({"FirstUTC": iso(t), "First": g.label.get(e, str(e)), "SecondUTC": iso(t2),
-                             "Second": g.label.get(e2, str(e2)), "GapSec": int(t2 - t)})
-            k += 1
+    events = sorted(((t, e) for e, t in g.time.items() if t and e[0] in TIMED_KINDS), key=lambda x: x[0])
+    pairs, left_out = near_pairs(events, window_min * 60, R21_MAX_PER_EVENT)
+    rows = []
+    for i, j in pairs:
+        (t, e), (t2, e2) = events[i], events[j]
+        g.link("R21", e, e2, f"{int(t2 - t)} s apart")
+        rows.append({"FirstUTC": iso(t), "First": g.label.get(e, str(e)), "SecondUTC": iso(t2),
+                     "Second": g.label.get(e2, str(e2)), "GapSec": int(t2 - t)})
     rel("R21", f"Events within {window_min} minutes of each other", "time",
-        f"any two of call / SMS / MMS / photo / notification / handoff less than {window_min} min apart"
-        " (photo-photo bursts left out). A lead to check, not proof of a link",
+        f"any two of call / SMS / MMS / RCS chat / RCS file / photo / notification / handoff at most {window_min}"
+        " minutes apart (photo-photo bursts left out). Each event is linked to its"
+        f" {R21_MAX_PER_EVENT} nearest at most; pairs left out by that limit: {left_out}."
+        " A lead to check, not proof of a link",
         ["FirstUTC", "First", "SecondUTC", "Second", "GapSec"], rows)
     rows = [{"_e": e, "TimeUTC": iso(t), "Kind": e[0], "What": g.label.get(e, str(e))} for t, e in events]
     rel("R22", "Unified timeline", "time", "every timed row from every database, phone clock, sorted",
         ["TimeUTC", "Kind", "What"], rows)
 
-    # R23 orphans
+    # R23 orphans. A key column this copy lacks is not a finding (it would flag every row), so such tables are skipped
+    def has_col(db, table, col):
+        return col in ev.columns(db, table)
+
     rows = []
     for p in part_rows:
-        if p["ThreadID"] not in sms_threads:
+        if has_col("phone.db", "participant", "thread_id") and p["ThreadID"] not in sms_threads:
             rows.append({"Problem": "participant without thread", "Table": "participant", "ID": p["ParticipantID"],
                          "MissingKey": p["ThreadID"]})
     for m in sms_rows:
-        if m["ThreadID"] not in sms_threads:
+        if has_col("phone.db", "message", "thread_id") and m["ThreadID"] not in sms_threads:
             rows.append({"Problem": "message without thread", "Table": "message", "ID": m["MessageID"],
                          "MissingKey": m["ThreadID"]})
     contact_ids = {c["ContactID"] for c in g.views["E_contacts"].rows}
-    for table in ("phonenumber", "emailaddress", "postaladdress", "contactdate", "contacturl"):
-        for r in ev.rows("contacts.db", f"SELECT rowid AS rid, contact_id FROM {table}", table):
+    for table, _ in SATELLITES:
+        if not has_col("contacts.db", table, "contact_id"):
+            continue
+        for r in T("contacts.db", table, ("rowid", "contact_id")):
             if r["contact_id"] not in contact_ids:
-                rows.append({"Problem": "contact detail without contact", "Table": table, "ID": r["rid"],
+                rows.append({"Problem": "contact detail without contact", "Table": table, "ID": r["rowid"],
                              "MissingKey": r["contact_id"]})
     for r in rcs:
-        if r["fallback_id"] not in sms_threads:
+        if has_col("phone.db", "rcs_conversation", "fallback_id") and r["fallback_id"] not in sms_threads:
             rows.append({"Problem": "RCS thread without SMS fallback thread", "Table": "rcs_conversation",
                          "ID": r["thread_id"], "MissingKey": r["fallback_id"]})
     rel("R23", "Orphans: rows whose partner is missing", "integrity",
@@ -745,12 +910,16 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
     # R25 sync completeness
     rows = []
     for db in P.DB_NAMES:
-        for r in ev.rows(db, "SELECT content_type, sequence, expected FROM content_sequence", "content_sequence"):
+        for r in T(db, "content_sequence", ("content_type", "sequence", "expected")):
             fdb, table = FEEDS.get(r["content_type"], (db, None))
             present = ev.count(fdb, table) if table else None
             status = ""
-            if r["sequence"] >= 0 and r["expected"] >= 0:
-                status = "complete" if r["sequence"] == r["expected"] else "INCOMPLETE (sequence != expected)"
+            seq, exp = whole(r["sequence"]), whole(r["expected"])
+            if seq is not None and exp is not None:
+                if seq >= 0 and exp >= 0:
+                    status = "complete" if seq == exp else "INCOMPLETE (sequence != expected)"
+            elif r["sequence"] is not None and r["expected"] is not None:
+                status = "cannot compare (a value is not a number)"
             rows.append({"Database": db, "Feed": r["content_type"], "Table": table or "?", "Sequence": r["sequence"],
                          "Expected": r["expected"], "RowsPresent": present, "Status": status})
     rel("R25", "Sync completeness per feed", "integrity",
@@ -767,6 +936,7 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
             "R06": "phone.db", "R07": "phone.db", "R08": "phone.db", "R09": "phone.db", "R10": "phone.db",
             "R11": "phoneapps.db"}
     for vid, v in g.views.items():
+        v.basis += ev.missing_note(view_sources(vid))
         if v.db is None:
             v.db = DBOF.get(vid)
         if v.kind == "entity":

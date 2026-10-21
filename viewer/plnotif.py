@@ -55,10 +55,27 @@ COLS = (["Source", "RowID", "NotificationID", "Package", "PostTimeUTC", "JSONPos
 GROUP_PAIRS_MAX = 50   # see link_group()
 
 
+def cell(v):
+    """A value for a table cell: yes/no for booleans, JSON text for a list or object (so it can be a group key)."""
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, (list, dict)):
+        return json.dumps(v, ensure_ascii=False, sort_keys=True)
+    return v
+
+
+def count_key(v):
+    """Sort key for a json count that may be a number, text or NULL: numbers first, text after."""
+    try:
+        return (0, float(v or 0), "")
+    except (TypeError, ValueError, OverflowError):
+        return (1, 0.0, str(v))
+
+
 def decode_flags(v):
     try:
         v = int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return ""
     names = [n for bit, n in FLAGS if v & bit]
     rest = v & ~sum(b for b, _ in FLAGS)
@@ -70,7 +87,7 @@ def decode_enum(v, table):
         return ""
     try:
         return f"{v} ({table.get(int(v), 'unknown')})"
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return str(v)
 
 
@@ -98,12 +115,24 @@ def build(ev, g, View, ts_seconds, iso):
     if DB not in ev.paths:
         return []
     raw = []  # (source, rowid, dict of columns, carved_from)
-    for r in ev.rows(DB, "SELECT * FROM notifications ORDER BY post_time", "notifications"):
+    for r in ev.table(DB, "notifications", ("id", "notification_id", "package_name", "json", "post_time", "state",
+                                            "anonymous_id"), order=("post_time",)):
         raw.append(("live", r["id"], r, ""))
-    recs, _ = plcarve.carve_db(ev.paths[DB], include_wal=True)
-    toasts_raw = [("live", r) for r in ev.rows(DB, "SELECT * FROM notification_toastmappings",
-                                              "notification_toastmappings")]
-    reqs_raw = [("live", r) for r in ev.rows(DB, "SELECT * FROM phone_requests", "phone_requests")]
+    try:
+        recs, stats = plcarve.carve_db(ev.paths[DB], include_wal=True)
+        errors = list(stats.get("errors") or [])
+    except Exception as e:  # noqa: BLE001 - a carving failure must show, not hide the live rows
+        recs, errors = [], [f"{type(e).__name__}: {e}"]
+    carve_note = ""
+    if errors:   # the carver reports what it could not read; deleted rows may then be missing
+        carve_note = (" - CARVING ERRORS (deleted rows may be missing): " + "; ".join(errors[:5])
+                      + (f" (+{len(errors) - 5} more)" if len(errors) > 5 else ""))
+    toasts_raw = [("live", r) for r in ev.table(DB, "notification_toastmappings", ("id", "notification_id", "toast_id"))]
+    reqs_raw = [("live", r) for r in ev.table(
+        DB, "phone_requests", ("unique_id", "request_id", "request_external_id1", "request_external_id2",
+                               "request_payload", "request_content_type", "request_status", "request_state",
+                               "request_time_added", "request_time_started", "request_time_finished",
+                               "request_expiration_time"))]
     for c in recs:
         where = f"{c.get('source_file')} page {c.get('page')} {c.get('region')} @{c.get('offset')}"
         if c["table"] == "notifications" and c.get("status") != "also_live":
@@ -137,7 +166,7 @@ def build(ev, g, View, ts_seconds, iso):
                "CarvedFrom": where}
         for col, key in JSON_COLS:
             v = o.get(key)
-            row[col] = ("yes" if v else "no") if isinstance(v, bool) else v
+            row[col] = cell(v)
         rows.append(row)
         g.time[e] = t_col or ts_seconds(o.get("postTime"))
         g.label[e] = f"{source} notification: {row['AppName'] or row['Package']} - {row['Title'] or ''}".strip()
@@ -145,7 +174,7 @@ def build(ev, g, View, ts_seconds, iso):
             sender = senders[i] if i < len(senders) else ""
             me = ("notifmsg", f"{e[1]}:{i}")
             msg_rows.append({"_e": me, "Notification": g.label[e], "Source": source, "Position": i + 1,
-                             "Sender": sender, "Message": m})
+                             "Sender": cell(sender), "Message": cell(m)})
             g.label[me] = f"message {i + 1} from {sender or 'unknown'}"
             g.link("NR5", e, me, "This message is inside the notification (messages[] / senderNames[])")
         for a in actions:
@@ -153,7 +182,7 @@ def build(ev, g, View, ts_seconds, iso):
                 continue
             ae = ("notifact", f"{e[1]}:{a.get('actionIndex')}")
             act_rows.append({"_e": ae, "Notification": g.label[e], "Source": source,
-                             "ActionIndex": a.get("actionIndex"), "ActionName": a.get("actionName"),
+                             "ActionIndex": cell(a.get("actionIndex")), "ActionName": cell(a.get("actionName")),
                              "InlineReply": "yes" if a.get("isActionInlineReply") else "no"})
             g.label[ae] = f"button '{a.get('actionName')}'"
             g.link("NR6", e, ae, "This button was on the notification (notificationActions[])")
@@ -165,7 +194,8 @@ def build(ev, g, View, ts_seconds, iso):
         return vid
 
     vids = [add("N_notifications", "notifications - live and deleted, JSON unpacked", "table",
-                "notifications table + rows carved from free space; every json field as a column", COLS, rows),
+                "notifications table + rows carved from free space; every json field as a column" + carve_note,
+                COLS, rows),
             add("N_messages", "notifications - chat messages inside each notification", "table",
                 "messages[] and senderNames[] from the json column, one row per message",
                 ["Notification", "Source", "Position", "Sender", "Message"], msg_rows),
@@ -180,7 +210,8 @@ def build(ev, g, View, ts_seconds, iso):
                            "ToastID": t.get("toast_id")})
         g.label[te] = f"{source} Windows toast {t.get('toast_id')}"
     vids.append(add("N_toasts", "notification_toastmappings", "table",
-                    "notification_toastmappings, live + carved", ["Source", "ID", "NotificationID", "ToastID"],
+                    "notification_toastmappings, live + carved" + carve_note,
+                    ["Source", "ID", "NotificationID", "ToastID"],
                     toast_rows))
     req_rows = []
     for i, (source, q) in enumerate(reqs_raw):
@@ -195,7 +226,7 @@ def build(ev, g, View, ts_seconds, iso):
                          "Payload": q.get("request_payload")})
         g.label[qe] = f"{source} phone request {q.get('request_content_type') or ''} {q.get('request_id') or ''}"
     vids.append(add("N_requests", "phone_requests", "table",
-                    "phone_requests, live + carved; times by magnitude (epoch unconfirmed)",
+                    "phone_requests, live + carved; times by magnitude (epoch unconfirmed)" + carve_note,
                     ["Source", "UniqueID", "RequestID", "ExternalID1", "ExternalID2", "ContentType", "Status", "State",
                      "AddedUTC", "StartedUTC", "FinishedUTC", "ExpiresUTC", "Payload"], req_rows))
 
@@ -208,7 +239,8 @@ def build(ev, g, View, ts_seconds, iso):
                 for other in members[i + 1:]:
                     g.link(rid, m["_e"], other["_e"], note)
             return
-        chain = sorted(members, key=lambda r: (r["JSONPostTimeUTC"] or r["PostTimeUTC"] or "", r["EventCount"] or 0))
+        chain = sorted(members, key=lambda r: (r["JSONPostTimeUTC"] or r["PostTimeUTC"] or "",
+                                               count_key(r["EventCount"])))
         for m, nxt in zip(chain, chain[1:]):
             g.link(rid, m["_e"], nxt["_e"], f"{note} - group of {len(members)}, linked to the next one in time")
 
@@ -246,7 +278,7 @@ def build(ev, g, View, ts_seconds, iso):
 
     rel = []
     for key, members in groups(lambda r: r["Key"]).items():
-        members = sorted(members, key=lambda r: (r["JSONPostTimeUTC"] or "", r["EventCount"] or 0))
+        members = sorted(members, key=lambda r: (r["JSONPostTimeUTC"] or "", count_key(r["EventCount"])))
         link_group("NR3", members, "Same Android notification (key) - another version of it")
         for i, m in enumerate(members):
             rel.append({"_e": m["_e"], "Key": key, "Version": i + 1, "Row": g.label[m["_e"]], "Source": m["Source"],
@@ -273,12 +305,13 @@ def build(ev, g, View, ts_seconds, iso):
             if "isGroup" in o and o.get("groupKey") and o.get("key"):
                 checks.append(("isGroup = belongs to an app group (groupKey is not its own key) [inferred]",
                                bool(o["isGroup"]) == (o["groupKey"] != o["key"])))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
         if r["PostTimeUTC"] and r["JSONPostTimeUTC"]:
             checks.append(("post_time column = json postTime (to the second)", r["PostTimeUTC"] == r["JSONPostTimeUTC"]))
         if r["Messages"] or r["Senders"]:
-            checks.append(("one sender per message", len(o.get("senderNames") or []) == len(o.get("messages") or [])))
+            n_msgs, n_senders = (len(o[k]) if isinstance(o.get(k), list) else 0 for k in ("messages", "senderNames"))
+            checks.append(("one sender per message", n_senders == n_msgs))
         for name, ok in checks:
             rel.append({"_e": r["_e"], "Row": g.label[r["_e"]], "Check": name,
                         "Result": "agrees" if ok else "DISAGREES"})
@@ -313,11 +346,14 @@ def build(ev, g, View, ts_seconds, iso):
                                                                                                   "Notification"],
                     rel, entity=False))
     rel = []
-    keys = {r["Key"]: r for r in rows if r["Key"]}
+    keys = {}   # json key -> every row with it (a live row and its deleted earlier versions share one key)
+    for r in rows:
+        if r["Key"]:
+            keys.setdefault(r["Key"], []).append(r)
     for q in req_rows:
         for col in ("ExternalID1", "ExternalID2"):
             v = q[col]
-            hits = by_nid.get(v, []) + ([keys[v]] if v in keys else [])
+            hits = by_nid.get(v, []) + [k for k in keys.get(v, []) if k not in by_nid.get(v, [])]
             for h in hits:
                 g.link("ND2", h["_e"], q["_e"], f"A phone request names this notification in {col}")
                 rel.append({"_e": q["_e"], "RequestID": q["RequestID"], "MatchedColumn": col, "ContentType": q["ContentType"],

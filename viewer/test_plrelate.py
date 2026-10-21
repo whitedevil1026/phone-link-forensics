@@ -4,10 +4,14 @@
 """
 import glob
 import hashlib
+import json
 import os
+import re
+import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -287,6 +291,262 @@ class Notifications(unittest.TestCase):
                 self.assertIn(v.db, R.P.DB_NAMES, vid)
         self.assertEqual({v.db for v in self.g.views.values() if v.vid.startswith(("N_", "NR", "ND"))},
                          {"notifications.db"})
+
+
+def build_edited(case, edits=None, **kw):
+    """pldemo device in a folder of its own, optional SQL edits {db: [sql | (sql, params)]}, built graph."""
+    tmp = tempfile.mkdtemp(prefix="plrelate-test-")
+    case.addCleanup(shutil.rmtree, tmp, True)
+    src = pldemo.build(os.path.join(tmp, "device"))
+    for db, stmts in (edits or {}).items():
+        con = sqlite3.connect(os.path.join(src, db))
+        for st in stmts:
+            con.execute(*((st,) if isinstance(st, str) else st))
+        con.commit()
+        con.close()
+    ev = R.Evidence(src)
+    case.addCleanup(ev.close)
+    return ev, R.build(ev, **kw)
+
+
+def linked_to(g, entity, rid):
+    return {e for r, e, _ in g.links(entity) if r == rid}
+
+
+def drop_column(path, table, col):
+    """Remove one column from a database copy: ALTER, or rebuild the table without constraints."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute(f'ALTER TABLE "{table}" DROP COLUMN "{col}"')
+    except sqlite3.OperationalError:     # unique, indexed or foreign-key columns cannot be altered away
+        keep = [r for r in con.execute(f'PRAGMA table_info("{table}")') if r[1] != col]
+        names = ", ".join('"%s"' % r[1] for r in keep)
+        defs = ", ".join('"%s" %s' % (r[1], r[2]) for r in keep)
+        con.execute(f'CREATE TABLE "_new" ({defs})')
+        con.execute(f'INSERT INTO "_new" ({names}) SELECT {names} FROM "{table}"')
+        con.execute(f'DROP TABLE "{table}"')
+        con.execute(f'ALTER TABLE "_new" RENAME TO "{table}"')
+    con.commit()
+    con.close()
+
+
+class SchemaTolerance(unittest.TestCase):
+    """A Phone Link build that lacks one column must not stop the other views from being built."""
+
+    def test_dropping_any_single_column_still_builds(self):
+        with tempfile.TemporaryDirectory() as d:
+            pristine = pldemo.build(os.path.join(d, "device"))
+            ev0 = R.Evidence(pristine)
+            base = {v for v in R.build(ev0).views if not v.startswith("M_")}
+            ev0.close()
+            cases = []
+            for db in sorted(os.listdir(pristine)):
+                con = sqlite3.connect(os.path.join(pristine, db))
+                tables = [r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+                for table in tables:
+                    for r in con.execute(f'PRAGMA table_info("{table}")'):
+                        if not r[5]:                      # not part of the primary key
+                            cases.append((db, table, r[1]))
+                con.close()
+            self.assertGreater(len(cases), 150)
+            failures = []
+            for n, (db, table, col) in enumerate(cases):
+                copy = os.path.join(d, f"c{n}")
+                shutil.copytree(pristine, copy)
+                drop_column(os.path.join(copy, db), table, col)
+                try:
+                    ev = R.Evidence(copy)
+                    try:
+                        got = {v for v in R.build(ev).views if not v.startswith("M_")}
+                    finally:
+                        ev.close()
+                    if got != base:
+                        failures.append(f"{db}.{table}.{col}: views differ {sorted(got ^ base)}")
+                except Exception as e:  # noqa: BLE001 - the point is that nothing may be raised
+                    failures.append(f"{db}.{table}.{col}: {type(e).__name__}: {e}")
+                shutil.rmtree(copy, ignore_errors=True)
+            self.assertEqual(failures, [])
+
+    def test_missing_column_is_stated_and_the_rest_is_shown(self):
+        ev, g = build_edited(self, {"phone.db": ["ALTER TABLE message DROP COLUMN body"]})
+        v = g.views["E_sms"]
+        self.assertEqual(len(v.rows), 3)
+        self.assertEqual(v.rows[0]["Address"], pldemo.ALICE)
+        self.assertIn("message.body", v.basis)
+        self.assertNotIn("message.body", g.views["E_calls"].basis)
+
+    def test_missing_notification_column_is_stated(self):
+        ev, g = build_edited(self, {"notifications.db": ["ALTER TABLE notifications DROP COLUMN state"]})
+        self.assertGreaterEqual(len(g.views["N_notifications"].rows), 3)   # the live rows
+        self.assertIn("notifications.state", g.views["N_notifications"].basis)
+        self.assertIn("notifications.state", g.views["NR3"].basis)
+
+    def test_missing_key_column_does_not_invent_orphans(self):
+        ev, g = build_edited(self, {"phone.db": ["ALTER TABLE message DROP COLUMN thread_id"]})
+        self.assertFalse([r for r in g.views["R23"].rows if r["Problem"] == "message without thread"])
+        self.assertIn("message.thread_id", g.views["E_sms"].basis)
+        self.assertIn("message.thread_id", g.views["R23"].basis)
+
+    def test_missing_contact_link_column(self):
+        ev, g = build_edited(self, {"contacts.db": ["ALTER TABLE phonenumber DROP COLUMN contact_id"]})
+        self.assertIn("phonenumber.contact_id", g.views["R13"].basis)
+        self.assertEqual(len(g.views["E_calls"].rows), 5)
+
+
+class Ambiguity(unittest.TestCase):
+    NUM = "+1-555-0150"
+
+    def call(self, n):
+        return ("INSERT INTO call_history (call_id, phone_number, duration, call_type, start_time) VALUES "
+                f"({n}, '{self.NUM}', 5, 1, {pldemo.ft(pldemo.at(900))})")
+
+    def number(self, n, contact):
+        return ("INSERT INTO phonenumber (phone_number_id, contact_id, phone_number, display_phone_number) VALUES "
+                f"({n}, {contact}, '{self.NUM}', '{self.NUM}')")
+
+    def test_two_contacts_with_the_same_name_are_ambiguous(self):
+        ev, g = build_edited(self, {"contacts.db": [
+            "INSERT INTO contact (contact_id, display_name) VALUES (10, 'Mum')",
+            "INSERT INTO contact (contact_id, display_name) VALUES (11, 'Mum')",
+            self.number(20, 10), self.number(21, 11)], "calling.db": [self.call(10)]})
+        row = [r for r in g.views["R13"].rows if r["CallID"] == 10][0]
+        self.assertEqual(row["Candidates"], 2)
+        self.assertIn("AMBIGUOUS", row["Basis"])
+        self.assertIn("2 contacts", row["Basis"])
+        self.assertEqual(linked_to(g, ("call", 10), "R13"), {("contact", 10), ("contact", 11)})
+
+    def test_one_unnamed_contact_is_one_candidate(self):
+        ev, g = build_edited(self, {"contacts.db": [
+            "INSERT INTO contact (contact_id, display_name) VALUES (12, NULL)", self.number(22, 12)],
+            "calling.db": [self.call(10)]})
+        row = [r for r in g.views["R13"].rows if r["CallID"] == 10][0]
+        self.assertEqual(row["Candidates"], 1)
+        self.assertNotIn("AMBIGUOUS", row["Basis"])
+        self.assertEqual(row["ContactName"], "contact 12")
+        party = {r["Party"] for r in g.views["R24"].rows if r["Finding"].startswith("communicated")}
+        self.assertNotIn(self.NUM, party)      # it is in the contacts, just without a name
+
+
+class R21Bounded(unittest.TestCase):
+    def burst(self, n, gap_ms=100, minute=2000):
+        base = pldemo.ms(pldemo.at(minute))
+        sql = ("INSERT INTO message (message_id, thread_id, from_address, type, body, timestamp, subscription_id)"
+               " VALUES (?, 1, ?, 1, 'x', ?, 1)")
+        return {"phone.db": [(sql, (1000 + i, pldemo.ALICE, base + i * gap_ms)) for i in range(n)]}
+
+    def test_big_burst_is_capped_per_event_and_counts_what_it_left_out(self):
+        t0 = time.time()
+        ev, g = build_edited(self, self.burst(1000))
+        self.assertLess(time.time() - t0, 10)
+        per = [len(linked_to(g, ("sms", 1000 + i), "R21")) for i in range(1000)]
+        self.assertLessEqual(max(per), R.R21_MAX_PER_EVENT)
+        self.assertGreater(min(per[100:900]), 40)
+        v = g.views["R21"]
+        omitted = int(re.search(r"left out by that limit: (\d+)", v.basis).group(1))
+        self.assertGreater(omitted, 0)
+        _, plain = build_edited(self)      # the demo's own events are far from the burst: their pairs are all kept
+        self.assertEqual(len(v.rows) + omitted, 1000 * 999 // 2 + len(plain.views["R21"].rows))
+        self.assertTrue({("sms", 1499), ("sms", 1501)} <= linked_to(g, ("sms", 1500), "R21"))   # nearest first
+
+    def test_pairs_match_a_plain_double_loop_when_nothing_is_capped(self):
+        import random
+        rnd = random.Random(5)
+        for _ in range(200):
+            ev = sorted(((rnd.choice([0, 3, 50, 100, 400, 700, 1000]) + rnd.randint(0, 5) * 7,
+                          (rnd.choice(["call", "sms", "photo", "photo"]), i)) for i in range(rnd.randint(0, 60))),
+                        key=lambda x: x[0])
+            w = rnd.choice([0, 30, 300])
+            plain = [(i, j) for i in range(len(ev)) for j in range(i + 1, len(ev))
+                     if ev[j][0] - ev[i][0] <= w and not (ev[i][1][0] == "photo" and ev[j][1][0] == "photo")]
+            self.assertEqual(R.near_pairs(ev, w, 1000), (plain, 0))
+            cap = rnd.choice([1, 2, 5])
+            pairs, left = R.near_pairs(ev, w, cap)
+            self.assertEqual(len(pairs) + left, len(plain))
+            self.assertTrue(set(pairs) <= set(plain))
+            used = [x for p in pairs for x in p]
+            self.assertTrue(all(used.count(x) <= cap for x in set(used)))
+
+    def test_window_edge_and_wording(self):
+        ev, g = build_edited(self, self.burst(2, gap_ms=300000, minute=3000))
+        self.assertIn(("sms", 1001), linked_to(g, ("sms", 1000), "R21"))   # exactly 5 minutes apart
+        self.assertIn("at most 5 minutes apart", g.views["R21"].basis)
+        self.assertIn("left out by that limit: 0", g.views["R21"].basis)
+
+
+class RcsTimeline(unittest.TestCase):
+    def test_rcs_chats_and_file_transfers_are_in_r22_and_r21(self):
+        ev, g = build_edited(self, {"phone.db": [
+            "INSERT INTO rcs_filetransfer (message_id, thread_id, from_address, timestamp) VALUES "
+            f"(7, 50, '{pldemo.BOB}', {pldemo.ft(pldemo.at(12))})"]})
+        kinds = {r["Kind"] for r in g.views["R22"].rows}
+        self.assertTrue({"rcs_chat", "rcs_filetransfer"} <= kinds)
+        t = [r["TimeUTC"] for r in g.views["R22"].rows]
+        self.assertEqual(t, sorted(t))
+        self.assertIn(("mms", 1), linked_to(g, ("rcs_chat", 1), "R21"))
+        self.assertIn(("rcs_filetransfer", 7), linked_to(g, ("rcs_chat", 1), "R21"))
+        self.assertIn(("rcs_chat", 1), g.home)
+
+
+class NotificationEdgeCases(unittest.TestCase):
+    def notif(self, nid, key, minute=10, **extra):
+        o = json.loads(pldemo.njson("com.example.chat", "x", minute, **extra))
+        o["key"] = key
+        return ("INSERT INTO notifications (notification_id, package_name, json, post_time) VALUES (?, ?, ?, ?)",
+                (nid, "com.example.chat", json.dumps(o), pldemo.ms(pldemo.at(minute))))
+
+    def test_nd2_keeps_every_row_with_the_same_key(self):
+        ev, g = build_edited(self, {"notifications.db": [
+            ("INSERT INTO phone_requests VALUES (2, 'req-2', 'unrelated', ?, '{}', 'example-reply', 1, ?, ?, ?, ?, 2)",
+             (pldemo.CHAT_KEY, pldemo.ms(pldemo.at(2)), pldemo.ms(pldemo.at(2)), pldemo.ms(pldemo.at(3)),
+              pldemo.ms(pldemo.at(60))))]})
+        shared = {r["Source"] for r in g.views["N_notifications"].rows if r["Key"] == pldemo.CHAT_KEY}
+        self.assertEqual(shared, {"live", "deleted"})          # the planted live row and its earlier deleted version
+        req = [r["_e"] for r in g.views["N_requests"].rows if r["RequestID"] == "req-2"][0]
+        self.assertEqual({e[1].split(":")[0] for e in linked_to(g, req, "ND2")}, {"live", "deleted"})
+        self.assertEqual(len([r for r in g.views["ND2"].rows if r["RequestID"] == "req-2"]), 2)
+
+    def test_list_and_dict_json_values_do_not_crash(self):
+        ev, g = build_edited(self, {"notifications.db": [
+            self.notif("odd-1", {"a": 1}, groupKey=["g", 1], conversationTitle=["t"]),
+            self.notif("odd-2", {"a": 1}, groupKey=["g", 1], conversationTitle=["t"])]})
+        self.assertEqual(len([r for r in g.views["NR1"].rows if r["GroupKey"].startswith("[")]), 2)
+        self.assertEqual(len([r for r in g.views["NR3"].rows if r["Key"].startswith("{")]), 2)
+        self.assertEqual(len([r for r in g.views["NR2"].rows if r["Conversation"].startswith("[")]), 2)
+
+    def test_mixed_text_and_number_event_counts_sort(self):
+        stmts = [self.notif(f"ec-{i}", "0|com.example.chat|55|null|1", 10 + i % 5,
+                            eventCount=(i if i % 2 else str(i)), groupKey="g:big") for i in range(52)]
+        ev, g = build_edited(self, {"notifications.db": stmts})
+        self.assertEqual(len([r for r in g.views["NR3"].rows if r["Key"].endswith("|55|null|1")]), 52)
+        self.assertEqual(len([r for r in g.views["NR1"].rows if r["GroupKey"] == "g:big"]), 52)   # > 50: chained
+
+    def test_carving_errors_are_shown(self):
+        real = R.plnotif.plcarve.carve_db
+        R.plnotif.plcarve.carve_db = lambda *a, **k: ([], {"errors": ["table 'notifications': boom"]})
+        try:
+            ev, g = build_edited(self)
+        finally:
+            R.plnotif.plcarve.carve_db = real
+        self.assertIn("boom", g.views["N_notifications"].basis)
+        self.assertIn("carving", g.views["N_notifications"].basis.lower())
+
+
+class OddValues(unittest.TestCase):
+    def test_text_sequence_and_expected(self):
+        ev, g = build_edited(self, {"calling.db": ["UPDATE content_sequence SET sequence = 'abc', expected = 'x'"],
+                                    "phone.db": ["UPDATE content_sequence SET expected = 'many' WHERE content_type = 'sms'"]})
+        got = {r["Feed"]: r for r in g.views["R25"].rows}
+        self.assertEqual(got["call_logs"]["Sequence"], "abc")
+        self.assertNotEqual(got["call_logs"]["Status"], "complete")
+        self.assertEqual(got["conversation"]["Status"], "complete")
+
+    def test_text_call_duration(self):
+        ev, g = build_edited(self, {"calling.db": ["UPDATE call_history SET duration = 'about a minute' WHERE call_id = 1"]})
+        alice = [r for r in g.views["R18"].rows if r["ContactName"] == "Alice Example"][0]
+        self.assertEqual(alice["TalkSec"], 30)
+        self.assertEqual(g.views["R20"].rows, [])       # the length of the call the photo fell in is unreadable
+
 
 if __name__ == "__main__":
     unittest.main()
