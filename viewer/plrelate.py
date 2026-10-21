@@ -118,14 +118,23 @@ class Evidence:
             for row in self.acq:
                 if row.get("status") != "copied":
                     continue
+                stable = row.get("source_stable", "yes") == "yes"
                 for suffix, key in (("", "sha256"), ("-wal", "wal_sha256"), ("-shm", "shm_sha256")):
-                    if row.get(key):
-                        copy = os.path.join(self.work, row["file"] + suffix)
+                    copy = os.path.join(self.work, row["file"] + suffix)
+                    if stable and row.get(key):
                         ok = P.sha256(copy) == row[key]
-                        self.verify.append({"file": row["file"] + suffix, "source_sha256": row[key],
+                        self.verify.append({"file": row["file"] + suffix, "source_sha256": row[key], "copy_sha256": "",
                                             "copy_matches": "yes" if ok else "NO",
-                                            "source_stable": row.get("source_stable", "yes")})
-            if any(v["copy_matches"] != "yes" for v in self.verify):
+                                            "source_stable": "yes"})
+                    elif not stable and os.path.isfile(copy):
+                        # The source never settled, so there is no source hash to check against; the copy is only
+                        # re-checked against the hash taken right after it was made.
+                        mine = row.get("copy" + (suffix.replace("-", "_") if suffix else "") + "_sha256", "")
+                        ok = P.sha256(copy) == mine
+                        self.verify.append({"file": row["file"] + suffix, "source_sha256": "", "copy_sha256": mine,
+                                            "copy_matches": "n/a - source changed during copy" if ok else "NO",
+                                            "source_stable": row["source_stable"]})
+            if any(v["copy_matches"] == "NO" for v in self.verify):
                 raise IOError("a staged copy does not match its source hash")
         except BaseException:
             shutil.rmtree(self.work, ignore_errors=True)  # do not leave a bad or partial copy behind
@@ -950,7 +959,7 @@ def build(ev, window_min=DEFAULT_WINDOW_MIN, map_dirs=None):
 
     # ---------- provenance + map output
     add(View("P_copies", "Copies and hashes", "provenance", f"staged from {ev.src} to {ev.work}",
-             ["file", "source_sha256", "copy_matches"], ev.verify))
+             ["file", "source_sha256", "copy_sha256", "copy_matches", "source_stable"], ev.verify))
     for vid, view in run_maps(ev, map_dirs or DEFAULT_MAP_DIRS).items():
         add(view)
     return g

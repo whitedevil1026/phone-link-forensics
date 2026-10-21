@@ -11,7 +11,7 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 BASE = datetime(2030, 1, 1, 12, 0, 0)
 FT_EPOCH = datetime(1601, 1, 1)
@@ -349,7 +349,7 @@ def build_package(root):
     con.commit()
     con.close()
     time.sleep(1.2)                                           # the older pairings exist before this phone registers
-    reg = datetime.utcnow()
+    reg = datetime.now(timezone.utc).replace(tzinfo=None)     # naive UTC, as the rest of this file uses
     time.sleep(0.3)
     build(os.path.join(idx, PAIRING_GUIDS[2], "System", "Database"))   # current pairing folder appears just after
     ft = os.path.join(idx, "FullTrust")

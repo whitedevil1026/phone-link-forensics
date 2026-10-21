@@ -189,8 +189,9 @@ def stage(src_dir, work, acq):
     A live database can change while its three files are copied one after another, which
     would give a .db and a -wal from different moments. The .db and -wal are hashed before
     and after each set; if either changed the whole set is copied again (3 tries). A set
-    that never settles is kept, and its row says so: source_stable = UNSTABLE, and the
-    recorded hashes are those of the copy actually taken.
+    that never settles is kept, and its row says so: source_stable = UNSTABLE. Such a row
+    holds no source hash (sha256 is ""); the hashes of the copy actually taken are
+    copy_sha256 / copy_wal_sha256 / copy_shm_sha256.
     """
     os.makedirs(work, exist_ok=True)
     staged = {}
@@ -213,18 +214,23 @@ def stage(src_dir, work, acq):
                 stable = True
                 break
         row = {"file": name, "status": "copied", "bytes": os.path.getsize(dst),
-               "sha256": before[0] if stable else sha256(dst),
+               "sha256": before[0] if stable else "",
                "wal": "", "shm": "", "wal_sha256": "", "shm_sha256": "",
                "source_stable": "yes" if stable else UNSTABLE}
+        if not stable:
+            # No source hash settled, so none is claimed. The copy's own hash is kept under its own name.
+            row["copy_sha256"] = sha256(dst)
         for suf in ("-wal", "-shm"):
             if os.path.isfile(dst + suf):
                 k = suf[1:]
                 row[k] = os.path.getsize(dst + suf)
                 # The WAL can hold most of the evidence, so it needs a hash too.
-                if suf == "-wal":
-                    row[k + "_sha256"] = before[1] if stable else sha256(dst + suf)
+                if not stable:
+                    row["copy_" + k + "_sha256"] = sha256(dst + suf)
+                elif suf == "-wal":
+                    row[k + "_sha256"] = before[1]
                 else:
-                    row[k + "_sha256"] = sha256(src + suf) if stable else sha256(dst + suf)
+                    row[k + "_sha256"] = sha256(src + suf)
         acq.append(row)
         staged[name] = dst
     return staged
@@ -686,10 +692,16 @@ def html_report(out, case, dev, meta, acq, health, d, tl, counts, digits, warnin
             return ""
         return esc(a["wal"]) if a.get("wal") else "<span class=warn>none</span>"
 
+    def hash_cell(a):
+        # An unstable source has no source hash; show the copy's hash and say whose it is.
+        if a.get("sha256"):
+            return a["sha256"][:32]
+        return ("copy only: " + a["copy_sha256"][:20]) if a.get("copy_sha256") else ""
+
     acq_rows = "".join(
         "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=mono>%s</td></tr>" % (
             esc(a.get("file")), esc(a.get("status")), esc(a.get("bytes", "")),
-            wal_cell(a), esc(a.get("shm", "")), esc((a.get("sha256") or "")[:32]))
+            wal_cell(a), esc(a.get("shm", "")), esc(hash_cell(a)))
         for a in acq)
 
     hl = "".join("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (

@@ -99,14 +99,21 @@ def decode_key(key):
     return [p if p != "null" else "" for p in parts]
 
 
-def parse_json(text):
-    """(dict, status). Carved JSON can be cut off; keep whatever parses."""
+CUT_NOTE = "value cut - rest was on overflow pages (not read)"
+CUT_STATUS = "cut off at an overflow page boundary - the rest was not read"
+
+
+def parse_json(text, cut=False):
+    """(dict, status). Carved JSON can be cut off; keep whatever parses. cut: the carver stopped this record at
+    an overflow boundary, so a json that fails to parse was cut there, not damaged."""
     if not text:
-        return {}, "empty"
+        return ({}, CUT_STATUS) if cut else ({}, "empty")
     try:
         o = json.loads(text)
-        return (o, "parsed") if isinstance(o, dict) else ({}, "not an object")
+        return (o, "parsed") if isinstance(o, dict) else ({}, CUT_STATUS if cut else "not an object")
     except (ValueError, TypeError):
+        if cut:
+            return {}, CUT_STATUS
         return {}, "damaged (cut off or overwritten) - raw text kept in the database"
 
 
@@ -144,7 +151,12 @@ def build(ev, g, View, ts_seconds, iso):
 
     rows, msg_rows, act_rows = [], [], []
     for n, (source, rowid, r, where) in enumerate(raw):
-        o, status = parse_json(r.get("json"))
+        cut = bool(r.get("overflow_lost"))
+        o, status = parse_json(r.get("json"), cut)
+        if cut:
+            where = f"{where} - {CUT_NOTE}"
+        if r.get("status") == plcarve.UNKNOWN_LIVE:
+            where = f"{where} - live rows unreadable, so this may not be deleted"
         e = ("notif", f"{source}:{rowid if source == 'live' else n}")
         msgs = o.get("messages") if isinstance(o.get("messages"), list) else []
         senders = o.get("senderNames") if isinstance(o.get("senderNames"), list) else []
@@ -223,7 +235,8 @@ def build(ev, g, View, ts_seconds, iso):
                          "StartedUTC": iso(ts_seconds(q.get("request_time_started"))),
                          "FinishedUTC": iso(ts_seconds(q.get("request_time_finished"))),
                          "ExpiresUTC": iso(ts_seconds(q.get("request_expiration_time"))),
-                         "Payload": q.get("request_payload")})
+                         "Payload": (f"{q.get('request_payload')} [{CUT_NOTE}]" if q.get("overflow_lost")
+                                     else q.get("request_payload"))})
         g.label[qe] = f"{source} phone request {q.get('request_content_type') or ''} {q.get('request_id') or ''}"
     vids.append(add("N_requests", "phone_requests", "table",
                     "phone_requests, live + carved; times by magnitude (epoch unconfirmed)" + carve_note,

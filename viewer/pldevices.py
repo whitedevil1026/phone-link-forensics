@@ -31,6 +31,7 @@ import sqlite3
 import stat
 import tempfile
 
+import plcarve
 import plparse
 
 GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -215,10 +216,26 @@ def _db_summary(pc, guid, info, ts_seconds):
                     n = c.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
                     n_db += n
             rows += n_db
-            for t in tables - set(DATA_TABLES.get(db, [])):   # rows in any other table are still data
-                if not t.startswith("sqlite_"):
-                    other += c.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
             details.append(f"{db}: {n_db} rows")
+            # Rows in any other table are still data - except bookkeeping that is rewritten constantly.
+            # Counted on its own so one table that cannot be read does not lose the activity range or the SIM.
+            found, failed = [], []
+            for t in sorted(tables - set(DATA_TABLES.get(db, [])) - plcarve.PLUMBING):
+                if t.startswith("sqlite_"):
+                    continue
+                try:
+                    n = c.execute('SELECT count(*) FROM "%s"' % t.replace('"', '""')).fetchone()[0]
+                except sqlite3.Error as e:
+                    failed.append(f"{t}: {e}")
+                    continue
+                other += n
+                if n:
+                    found.append(f"{t}: {n}")
+            if found:
+                details.append(f"{db}: other tables - " + ", ".join(found))
+            if failed:
+                details.append(f"{db}: could not count " + "; ".join(failed))
+                bad += 1
             for t, col in (("call_history", "start_time"), ("message", "timestamp"), ("media", "taken_time")):
                 if t in tables:
                     lo, hi = c.execute(f'SELECT min("{col}"), max("{col}") FROM "{t}" WHERE "{col}" > 0').fetchone()

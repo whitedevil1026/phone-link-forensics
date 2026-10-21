@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 import unittest
+import warnings
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -122,6 +123,74 @@ class PairingStatus(unittest.TestCase):
         self.assertEqual(got[G[3]], "data in other tables")
         self.assertEqual(got[G[4]], "databases present but empty")
         self.assertEqual(got[G[5]], "data present")
+
+
+class DemoPackageIsClean(unittest.TestCase):
+    def test_build_package_raises_no_deprecation_warning(self):
+        with tempfile.TemporaryDirectory() as tmp, warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            pldemo.build_package(os.path.join(tmp, "pkg"))
+
+
+class OtherTables(unittest.TestCase):
+    """'data in other tables' must not count bookkeeping tables, and must say which tables it counted."""
+
+    def summarize(self, files):
+        with WorkFolders(), tempfile.TemporaryDirectory() as tmp:
+            lc = make_pkg(tmp, folders=[(G[0], files)])
+            g = R.Graph()
+            _, pc = D.build(lc, g, R.View, R.ts_seconds, R.iso)
+            pc.close()
+        return g.views["PC_devices"].rows[0]
+
+    def test_only_bookkeeping_rows_is_empty(self):
+        row = self.summarize({"System/Database/calling.db": [
+            ("CREATE TABLE content_sequence (content_type TEXT, sequence INTEGER)",
+             ["INSERT INTO content_sequence VALUES ('call_logs', 7)"]),
+            ("CREATE TABLE _change_notifications (id INTEGER PRIMARY KEY, what TEXT)",
+             ["INSERT INTO _change_notifications (what) VALUES ('x')", "INSERT INTO _change_notifications (what) VALUES ('y')"]),
+            ("CREATE TABLE call_history (id INTEGER, start_time INTEGER)", [])]})
+        self.assertEqual(row["Status"], "databases present but empty")
+
+    def test_rows_in_an_unknown_table_are_named(self):
+        row = self.summarize({"System/Database/calling.db": [
+            ("CREATE TABLE content_sequence (content_type TEXT)", ["INSERT INTO content_sequence VALUES ('call_logs')"]),
+            ("CREATE TABLE mystery (a TEXT)", ["INSERT INTO mystery VALUES ('1')", "INSERT INTO mystery VALUES ('2')"]),
+            ("CREATE TABLE emptyone (a TEXT)", [])]})
+        self.assertEqual(row["Status"], "data in other tables")
+        self.assertIn("mystery: 2", row["Detail"])
+        self.assertNotIn("content_sequence", row["Detail"])
+        self.assertNotIn("emptyone", row["Detail"])
+
+    def test_table_name_with_a_double_quote(self):
+        row = self.summarize({"System/Database/settings.db": [
+            ('CREATE TABLE "we""ird" (a TEXT)', ["INSERT INTO \"we\"\"ird\" VALUES ('1')"])]})
+        self.assertEqual(row["Status"], "data in other tables")
+        self.assertIn('we"ird: 1', row["Detail"])
+
+    def test_a_table_that_cannot_be_counted_does_not_stop_the_activity_range(self):
+        with WorkFolders(), tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "src.db")
+            con = sqlite3.connect(path)
+            con.execute("CREATE TABLE message (id INTEGER, timestamp INTEGER)")
+            con.execute("INSERT INTO message VALUES (1, 1893456000)")
+            con.execute("CREATE TABLE junk (a TEXT)")
+            con.executemany("INSERT INTO junk VALUES (?)", [("x" * 50,)] * 20)
+            con.commit()
+            root = con.execute("SELECT rootpage FROM sqlite_master WHERE name='junk'").fetchone()[0]
+            ps = con.execute("PRAGMA page_size").fetchone()[0]
+            con.close()
+            with open(path, "rb") as fh:
+                data = bytearray(fh.read())
+            data[(root - 1) * ps:root * ps] = bytes([255]) * ps                 # the table's root page is garbage
+            lc = make_pkg(tmp, folders=[(G[0], {"System/Database/phone.db": bytes(data)})])
+            g = R.Graph()
+            _, pc = D.build(lc, g, R.View, R.ts_seconds, R.iso)
+            pc.close()
+        row = g.views["PC_devices"].rows[0]
+        self.assertEqual(row["DataRows"], 1)
+        self.assertTrue(row["FirstActivityUTC"].startswith("2030-01-01"), row)
+        self.assertIn("junk", row["Detail"])
 
 
 class BadSources(unittest.TestCase):

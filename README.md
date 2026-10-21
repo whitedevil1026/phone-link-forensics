@@ -104,11 +104,13 @@ That folder holds `phone.db` (SMS, MMS, RCS), `calling.db` (calls), `contacts.db
 ### How evidence is handled
 
 - **Copies only.** The input folder is copied to a temporary folder first: every `.db` with its `-wal` and `-shm`, plus the package files for *Linked phones*.
-- **Every copy is re-hashed (SHA-256) against its source.** A mismatch stops the load, and the bad copy is removed.
+- **A steady snapshot.** A live database can change while its `.db`, `-wal` and `-shm` are copied one after another. The `.db` and `-wal` are hashed before and after each set, and a set that changed is copied again (up to 3 tries). A source that never settles is still loaded, with a warning in the status bar, because a busy live source cannot be frozen without administrator rights. Its rows in **Copies and hashes** say `source changed during copy`, show no source hash (there is none to claim) and give the copy's own hash instead. Treat that copy as possibly mixing two moments.
+- **Every copy of a steady source is re-hashed (SHA-256) against its source.** A mismatch stops the load, and the bad copy is removed.
 - **Read-only.** Copies are opened with SQLite `mode=ro` and `query_only`. The source folder is never opened by SQLite.
-- **Deleted rows are carved from the copy** (`plcarve.py`): free pages, freeblocks, page slack and WAL frames. A record is recoverable only while its header survives, and a typical single-row delete overwrites it, so most recoveries come from whole free pages, page slack and WAL frames.
+- **Deleted rows are carved from the copy** (`plcarve.py`): free pages, freeblocks, page slack and WAL frames. A record is recoverable only while its header survives, and a typical single-row delete overwrites it, so most recoveries come from whole free pages, page slack and WAL frames. A long value is only partly on the page itself (the rest is on overflow pages, which are not read), so a carved value cut at that boundary is marked `value cut - rest was on overflow pages (not read)` instead of looking complete. If the live rows of a table cannot be read, its carved rows are labelled `unknown - live rows unreadable` rather than `deleted`.
 - **Cleanup.** Copies are deleted when the window closes. If a copy cannot be removed, the viewer says so and shows the path. On start it reports copy folders left by earlier runs.
 - **Secrets are never read.** Not read: the Bluetooth link keys, `PlatformEncryptedKeyStorage.json` and certificate bodies (only counted).
+- **Folder links are not followed.** When the Phone Link package is copied, a symlink or junction is skipped, not followed, and is listed in **Linked-phone copies and hashes** as `skipped - symlink or junction, not followed`.
 - **Read-only access to the live PC.** The cable / Bluetooth section reads the live registry and logs, and changes nothing.
 
 ### The window
@@ -126,7 +128,8 @@ That folder holds `phone.db` (SMS, MMS, RCS), `calling.db` (calls), `contacts.db
 - **Top bar:**
   - **Show inferred matches**: off by default, because matches across database files are the tool's inferences.
   - **Nearby (min)**: the window used for "events close in time".
-  - **Open folder…** and **Export view (CSV)**.
+  - **Open folder…** and **Export view (CSV)**. The export is written to a temporary file and moved into place, so a failure never leaves a half-written file. It is Excel-safe: a cell that starts with `=`, `+`, `-`, `@`, a tab or a line break gets a leading `'` so Excel shows it as text, unless the whole cell is a plain number (`-5`, `3.14`, `+15550100`); a phone number written as `+1 555 0100` does get the `'`. Binary values are written as `<N bytes>`.
+- **Keys and mouse.** Enter on a linked row jumps to it, like a double-click. The selected-row text is read-only (you can select and copy it). Unticking **Show inferred matches** removes the inferred views from the Contents list and the inferred lines from the linked rows, and leaves an inferred view if one is open.
 
 Every link carries its basis, colour-coded:
 
@@ -144,11 +147,12 @@ Every phone that has ever been linked to the PC through Phone Link, **including 
 
 | View | Source | What it shows |
 |---|---|---|
-| Phone pairings | `LocalCache\Indexed\<GUID>\` | One row per pairing, oldest first. The folder's creation time is when that phone was linked. Status: *data present* / *databases present but empty* / *folder only (data removed)*. Also: databases left, row counts, first/last activity, SIM, apps streamed |
+| Phone pairings | `LocalCache\Indexed\<GUID>\` | One row per pairing, oldest first. The folder's creation time is when that phone was linked. Status: *data present* / *data in other tables* (rows only in tables the viewer does not know; the tables are named in Detail as `table: rows`, and Phone Link's own bookkeeping tables are not counted) / *databases present but empty* / *unreadable database* / *files present but no databases* / *folder only - its data was removed*. Also: databases left, row counts, first/last activity, SIM, apps streamed |
 | Phone details | `LocalCache\DeviceMetadataStorage.json` | Per hardware ID: display name, manufacturer, model, Android version, Phone Link app version, capabilities, linked/enabled, registration and last-seen times. A hardware ID without details is a phone that was unlinked |
 | Trust relationships | `LocalCache\YppCryptoTrustRelationships` | Partner device, trust type, last access, key expiry, Microsoft account ID (MsaCid) |
 | Apps streamed per device | `LocalCache\Indexed\FullTrust\phone_apps.db` | `hosted_app_ids`: one row per app a phone streamed to the PC |
 | Pairing history | all of the above | Every linked-phone event in time order |
+| Linked-phone copies and hashes | the files above | Each package file copied, with its hash check; symlinks and junctions are listed as skipped |
 
 How they connect:
 - **Stored:** a trust relationship's partner ID is `<prefix>_<metadata Id>`.
@@ -161,7 +165,7 @@ Phones that reached the PC **without** Phone Link. This section reads the **live
 
 | View | What it shows |
 |---|---|
-| Phones (summary) | Every trace that looks like a phone, with the evidence: a phone driver on USB, the same ContainerID as a USB phone, Bluetooth class of device = Phone, or an MTP event 1005 naming the phone's make, model and OS version. Event 1005 also catches iPhones, which have no phone-specific driver |
+| Phones (summary) | Every trace that looks like a phone, with the evidence: a phone driver on USB, the same ContainerID as a USB phone, Bluetooth class of device = Phone, or an MTP event 1005 naming the phone's make, model and OS version. Event 1005 also catches iPhones, which have no phone-specific driver. **PhysicalDevice** groups the rows of one physical device (ContainerID, else Bluetooth address, else device ID) and **Serial** is the USB serial number when there is one. One phone still spans several rows; the column makes them groupable. An event-1005 row only knows make, model and OS, so it says *may be more than one phone* |
 | USB devices | Name, manufacturer, VID/PID, serial, driver, ContainerID, first install, key last-write time |
 | Portable devices (MTP) | The name shown in *This PC* when a phone was plugged in |
 | Bluetooth devices | Name, class of device, manufacturer ID, LMP version, VID/PID, **LastSeen**, **LastConnected** |
@@ -169,7 +173,8 @@ Phones that reached the PC **without** Phone Link. This section reads the **live
 | Bluetooth LE | Low Energy devices and the GATT services they offered |
 | AutoPlay known devices | The label AutoPlay showed this Windows user |
 | First driver install | The earliest time each device ID was installed, across the current and rotated setup logs |
-| Connection events | Event-log entries with Windows' own meaning for each ID |
+| Connection events | Event-log entries with Windows' own meaning for each ID. At most the newest 10,000 events of each log are read; the view's banner states the cap and says when it was reached |
+| Locations this account could not read | Registry keys, logs or event channels that were denied or failed to read, so you can tell an empty result from a failed one |
 
 Stored links between them:
 - **Same physical device:** USB, MTP, Bluetooth and AutoPlay entries that share a ContainerID.
@@ -328,6 +333,7 @@ yamllint -c .yamllint maps
 python tests/run_tests.py                          # maps: emulator of SQLECmd's matching, answer-key data
 python tests/run_tests.py --sqlecmd C:\Tools\SQLECmd.exe   # maps: also the real SQLECmd
 python tests/stress.py C:\Tools\SQLECmd.exe        # maps: large synthetic databases
+python viewer/test_plevidence.py                   # viewer: copying, snapshot stability, carving, read-only opens
 python viewer/test_plrelate.py                     # viewer: relations, planted answers
 python viewer/test_pldevices.py                    # viewer: linked phones
 python viewer/test_plconnect.py                    # viewer: USB cable / Bluetooth (synthetic registry)

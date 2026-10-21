@@ -380,9 +380,11 @@ class WindowFixesTest(unittest.TestCase):
 
     def test_csv_cells_are_excel_safe(self):
         c = V.csv_cell
-        for danger in ("=1+1", "@SUM(A1)", "\tx", "\rx", "+cmd|x", "-cmd", "+ 1", "-A1"):
+        for danger in ("=1+1", "@SUM(A1)", "\tx", "\rx", "+cmd|x", "-cmd", "+ 1", "-A1",
+                       "-2+3+cmd|' /C calc'!A0", "+1+1", "+1-555-0150", "+1 555", "-5-5", "-5.", "+5.5", "- 5", "-",
+                       "+", "-5\n", "--5", "+-5", "-٣"):
             self.assertEqual(c(danger), "'" + danger, danger)
-        for same in ("+15550100", "-5", "-5.5", "+1 555", "hello", "", "a=b", "12"):
+        for same in ("+15550100", "-5", "-5.5", "-0.5", "3.14", "hello", "", "a=b", "12", "0", "-0"):
             self.assertEqual(c(same), same, same)
         self.assertEqual(c(None), "")
         self.assertEqual(c(42), "42")
@@ -403,7 +405,11 @@ class WindowFixesTest(unittest.TestCase):
         col = v.cols.index("ContactName")
         got = [r[col] for r in rows[1:4]]
         self.assertEqual(got, ["'=HYPERLINK(1)", "<2 bytes>", "+15550100"])
-        self.assertIn("Excel-safe", self.app.status.cget("text"))
+        text = self.app.status.cget("text")
+        self.assertIn("Excel-safe", text)
+        self.assertIn("unless the whole cell is a plain number", text)     # the rule, stated
+        self.assertIn("-5", text)
+        self.assertIn("<N bytes>", text)
 
     # ---- 6 failed device switch
     def bad_device(self, name="bad"):
@@ -558,6 +564,47 @@ class WindowFixesTest(unittest.TestCase):
         self.assertIn("SNAPSHOT-NOTE-TEXT", self.app.status.cget("text"))
 
 
+class LinkedPhonesFailureTest(unittest.TestCase):
+    def test_package_copy_is_closed_when_the_connections_build_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as scratch:
+            root = pldemo.build_package(tmp)
+            old_tempdir, tempfile.tempdir = tempfile.tempdir, scratch      # count only the folders this test makes
+            app = V.Viewer(V.P.find_device_dirs(root), localcache=V.D.find_localcache(root),
+                           connections=V.C.demo_source())
+            app.withdraw()
+            app.update()
+            try:
+                def left():
+                    return [n for n in os.listdir(scratch) if n.startswith("pldevices-")]
+                g = V.R.build(app.ev)
+                kept = len(left())               # the one the open window holds
+                with mock.patch.object(V.C, "build", side_effect=KeyError("odd shape")):
+                    with self.assertRaises(KeyError):
+                        app._add_linked_phones(g)
+                self.assertEqual(len(left()), kept)      # the new package copy was closed, not leaked
+            finally:
+                app.on_close(warn=False)
+                tempfile.tempdir = old_tempdir
+
+    def test_failed_load_with_a_broken_connections_build_keeps_the_old_device(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as scratch:
+            root = pldemo.build_package(tmp)
+            old_tempdir, tempfile.tempdir = tempfile.tempdir, scratch
+            app = V.Viewer(V.P.find_device_dirs(root), localcache=V.D.find_localcache(root),
+                           connections=V.C.demo_source())
+            app.withdraw()
+            app.update()
+            try:
+                before = sorted(os.listdir(scratch))
+                with mock.patch.object(V.C, "build", side_effect=KeyError("odd shape")),                         mock.patch.object(V.messagebox, "showerror") as err:
+                    self.assertFalse(app.load_device(0))
+                self.assertEqual(err.call_count, 1)
+                self.assertEqual(sorted(os.listdir(scratch)), before)
+            finally:
+                app.on_close(warn=False)
+                tempfile.tempdir = old_tempdir
+
+
 class DemoRedactionTest(unittest.TestCase):
     def test_demo_mode_never_shows_a_local_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,6 +636,42 @@ class DemoRedactionTest(unittest.TestCase):
                 self.assertTrue(shown)
                 self.assertNotIn(os.path.normcase(tmp), os.path.normcase(shown[0]))
                 self.assertNotIn(os.path.normcase(tmp), os.path.normcase(app.status.cget("text")))
+            finally:
+                app.on_close(warn=False)
+
+    def test_empty_folder_dialog_is_redacted_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pldemo.build_package(tmp)
+            app = V.Viewer(V.P.find_device_dirs(root), localcache=V.D.find_localcache(root),
+                           connections=V.C.demo_source(), redact=True)
+            app.withdraw()
+            app.update()
+            try:
+                empty = os.path.join(tmp, "somebody-else-case")
+                os.makedirs(empty)
+                shown = []
+                with mock.patch.object(V.filedialog, "askdirectory", return_value=empty),                         mock.patch.object(V.messagebox, "showerror", lambda t, m: shown.append(m)):
+                    app.open_folder()
+                self.assertEqual(len(shown), 1)
+                self.assertNotIn("somebody-else-case", shown[0])
+                self.assertNotIn(os.path.normcase(tmp), os.path.normcase(shown[0]))
+                self.assertIn("synthetic demo folder", shown[0])
+            finally:
+                app.on_close(warn=False)
+
+    def test_empty_folder_dialog_names_the_folder_outside_demo_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = pldemo.build(os.path.join(tmp, "device"))
+            app = V.Viewer([("demo", src)])
+            app.withdraw()
+            app.update()
+            try:
+                empty = os.path.join(tmp, "empty-case")
+                os.makedirs(empty)
+                shown = []
+                with mock.patch.object(V.filedialog, "askdirectory", return_value=empty),                         mock.patch.object(V.messagebox, "showerror", lambda t, m: shown.append(m)):
+                    app.open_folder()
+                self.assertIn("empty-case", shown[0])
             finally:
                 app.on_close(warn=False)
 

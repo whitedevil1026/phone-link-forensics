@@ -207,6 +207,7 @@ def local_payload(usable, p):
 
 
 PLUMBING = {"_change_notifications", "content_sequence"}
+UNKNOWN_LIVE = "unknown - live rows unreadable"    # status when the table's live rowids could not be read
 
 
 def affinity(decl):
@@ -354,6 +355,7 @@ def carve_region(buf, start, length, shapes, ps, src, pno, kind, min_text=1, usa
 
 
 def live_rowids(db_path, table, errors=None):
+    """Rowids currently in the table, or None when they could not be read (then liveness is unknown)."""
     c = None
     try:
         c = sqlite3.connect(_ro(db_path), uri=True)
@@ -361,7 +363,7 @@ def live_rowids(db_path, table, errors=None):
     except Exception as e:
         if errors is not None:
             errors.append("live rows of %r: %s: %s" % (table, type(e).__name__, e))
-        return set()
+        return None
     finally:
         if c is not None:
             c.close()
@@ -419,7 +421,10 @@ def carve_db(db_path, include_wal=True, min_text=1, include_plumbing=False):
         t = r["table"]
         if t not in live_cache:
             live_cache[t] = live_rowids(db_path, t, stats["errors"])
-        r["status"] = "also_live" if r["rowid"] in live_cache[t] else "deleted_or_overwritten"
+        if live_cache[t] is None:
+            r["status"] = UNKNOWN_LIVE
+        else:
+            r["status"] = "also_live" if r["rowid"] in live_cache[t] else "deleted_or_overwritten"
         uniq.append(r)
     stats["records"] = len(uniq)
     stats["deleted_only"] = sum(1 for r in uniq if r["status"] != "also_live")

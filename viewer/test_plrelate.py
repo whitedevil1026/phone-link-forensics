@@ -521,6 +521,61 @@ class NotificationEdgeCases(unittest.TestCase):
         self.assertEqual(len([r for r in g.views["NR3"].rows if r["Key"].endswith("|55|null|1")]), 52)
         self.assertEqual(len([r for r in g.views["NR1"].rows if r["GroupKey"] == "g:big"]), 52)   # > 50: chained
 
+    def deleted_with_long_text(self, extra_edits=()):
+        long_json = pldemo.njson("com.example.chat", "0|com.example.chat|900|null|1", 20, text="A" * 6000)
+        stmts = ["DELETE FROM notifications"]
+        stmts += [("INSERT INTO notifications (notification_id, package_name, json, post_time) VALUES (?, ?, ?, ?)",
+                   (f"cut-{i}", "com.example.chat", long_json, pldemo.ms(pldemo.at(20)))) for i in range(2)]
+        stmts += [("INSERT INTO notifications (notification_id, package_name, json, post_time) VALUES (?, ?, ?, ?)",
+                   (f"short-{i}", "com.example.chat",
+                    pldemo.njson("com.example.chat", f"0|com.example.chat|{i}|null|1", 21, text=f"short {i}"),
+                    pldemo.ms(pldemo.at(21)))) for i in range(10)]
+        stmts += ["DELETE FROM notifications"]      # a full delete frees the pages whole, bytes intact
+        return build_edited(self, {"notifications.db": stmts})
+
+    def test_value_cut_at_an_overflow_boundary_is_marked(self):
+        ev, g = self.deleted_with_long_text()
+        rows = [r for r in g.views["N_notifications"].rows if r["Source"] == "deleted"]
+        cut = [r for r in rows if "value cut" in r["CarvedFrom"]]
+        self.assertTrue(cut, "no carved row was marked as cut")
+        for r in cut:
+            self.assertIn("value cut - rest was on overflow pages (not read)", r["CarvedFrom"])
+            self.assertIn("overflow", r["JSONStatus"])
+            self.assertNotIn("overwritten", r["JSONStatus"])
+        whole = [r for r in rows if "value cut" not in r["CarvedFrom"]]
+        self.assertTrue(whole)
+        for r in whole:
+            self.assertEqual(r["JSONStatus"], "parsed")
+
+    def test_cut_request_payload_is_marked(self):
+        ins = ("INSERT INTO phone_requests (request_id, request_external_id1, request_payload, request_content_type,"
+               " request_status, request_state, request_time_added, request_expiration_time)"
+               " VALUES (?, 'x', ?, 'example-reply', 1, 1, ?, ?)")
+        t = pldemo.ms(pldemo.at(5))
+        stmts = ["DELETE FROM phone_requests"]
+        stmts += [(ins, (f"long-{i}", "P" * 6000, t, t)) for i in range(2)]
+        stmts += [(ins, (f"short-{i}", f"short {i}", t, t)) for i in range(10)] + ["DELETE FROM phone_requests"]
+        ev, g = build_edited(self, {"notifications.db": stmts})
+        rows = [r for r in g.views["N_requests"].rows if r["Source"] == "deleted"]
+        cut = [r for r in rows if "value cut - rest was on overflow pages (not read)" in str(r["Payload"])]
+        self.assertTrue(cut)
+        for r in rows:
+            if r["RequestID"] and r["RequestID"].startswith("short"):
+                self.assertNotIn("value cut", str(r["Payload"]))
+
+    def test_unknown_live_status_keeps_the_carved_row(self):
+        real = R.plnotif.plcarve.live_rowids
+        R.plnotif.plcarve.live_rowids = lambda *a, **k: None       # the live rows could not be read
+        try:
+            ev, g = self.deleted_with_long_text()
+        finally:
+            R.plnotif.plcarve.live_rowids = real
+        rows = [r for r in g.views["N_notifications"].rows if r["Source"] == "deleted"]
+        self.assertTrue(rows)
+        self.assertTrue(all("unreadable" in r["CarvedFrom"] for r in rows))
+        recs, st = R.plnotif.plcarve.carve_db(ev.paths["notifications.db"])
+        self.assertTrue(recs)
+
     def test_carving_errors_are_shown(self):
         real = R.plnotif.plcarve.carve_db
         R.plnotif.plcarve.carve_db = lambda *a, **k: ([], {"errors": ["table 'notifications': boom"]})

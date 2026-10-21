@@ -85,6 +85,45 @@ class SnapshotStability(unittest.TestCase):
         finally:
             ev.close()
 
+    def test_unstable_set_does_not_claim_a_source_hash(self):
+        def writer(n):
+            self.w.execute("INSERT INTO t (v) VALUES (?)", ("late%d" % n,))
+            self.w.commit()
+            self.w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.hook(writer)
+        ev = R.Evidence(self.src)
+        try:
+            row = [a for a in ev.acq if a["file"] == "phone.db"][0]
+            self.assertEqual(row["sha256"], "")                  # no source hash was ever settled
+            self.assertEqual(row["copy_sha256"], P.sha256(os.path.join(ev.work, "phone.db")))
+            for v in ev.verify:
+                self.assertEqual(v["source_sha256"], "")
+                self.assertEqual(v["copy_matches"], "n/a - source changed during copy")
+                self.assertEqual(v["copy_sha256"], P.sha256(os.path.join(ev.work, v["file"])))
+            g = R.build(ev)
+            view = g.views["P_copies"]
+            self.assertEqual(view.cols, ["file", "source_sha256", "copy_sha256", "copy_matches", "source_stable"])
+            self.assertTrue(all(r["copy_matches"].startswith("n/a") for r in view.rows))
+            self.assertTrue(all(r["source_stable"] == P.UNSTABLE for r in view.rows))
+        finally:
+            ev.close()
+
+    def test_stable_set_keeps_its_source_hash(self):
+        ev = R.Evidence(self.src)
+        try:
+            row = [a for a in ev.acq if a["file"] == "phone.db"][0]
+            self.assertEqual(row["sha256"], P.sha256(os.path.join(self.src, "phone.db")))
+            self.assertNotIn("copy_sha256", row)
+            for v in ev.verify:
+                self.assertEqual(v["copy_matches"], "yes")
+                self.assertTrue(v["source_sha256"])
+            g = R.build(ev)
+            view = g.views["P_copies"]
+            self.assertEqual(view.cols, ["file", "source_sha256", "copy_sha256", "copy_matches", "source_stable"])
+            self.assertTrue(all(r["copy_matches"] == "yes" and r["source_stable"] == "yes" for r in view.rows))
+        finally:
+            ev.close()
+
     def test_one_off_change_is_retried_and_copy_holds_the_data(self):
         def once(n):
             if n == 1:
@@ -176,6 +215,97 @@ class Overflow(unittest.TestCase):
             for r in recs:
                 if r.get("tag") == "s":
                     self.assertNotIn("overflow_lost", r)
+
+
+class UnreadableLiveRows(unittest.TestCase):
+    def test_status_is_unknown_not_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "n.db")
+            make_deleted_notes(path, [("t", "gone %d" % i) for i in range(20)])
+            recs, st = plcarve.carve_db(path)
+            self.assertTrue(recs)
+            self.assertEqual({r["status"] for r in recs}, {"deleted_or_overwritten"})   # unchanged when readable
+            real_live = plcarve.live_rowids
+            plcarve.live_rowids = lambda db, table, errors=None: None     # as when the live table cannot be read
+            try:
+                recs, st = plcarve.carve_db(path)
+            finally:
+                plcarve.live_rowids = real_live
+            self.assertTrue(recs)
+            self.assertEqual({r["status"] for r in recs}, {plcarve.UNKNOWN_LIVE})
+            self.assertEqual(plcarve.UNKNOWN_LIVE, "unknown - live rows unreadable")
+
+    def test_live_rowids_returns_none_when_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "n.db")
+            make_deleted_notes(path, [("t", "x")])
+            errs = []
+            self.assertIsNone(plcarve.live_rowids(path, "no_such_table", errs))
+            self.assertTrue(errs)
+            self.assertEqual(plcarve.live_rowids(path, "notes"), set())
+
+
+class OverflowOtherPageSizes(unittest.TestCase):
+    """local_payload with a 1,024-byte page and with reserved bytes at the end of each page (header byte 20)."""
+    TEXT = 3000
+
+    def make(self, folder):
+        path = os.path.join(folder, "n.db")
+        c = sqlite3.connect(path)
+        c.execute("PRAGMA page_size=1024")
+        c.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, tag TEXT, body TEXT)")
+        c.executemany("INSERT INTO notes (tag, body) VALUES (?, ?)",
+                      [("long", "A" * self.TEXT), ("lone", "B" * self.TEXT)] + [("s", "short %d" % i) for i in range(40)])
+        c.commit()
+        c.execute("DELETE FROM notes")
+        c.commit()
+        c.close()
+        return path
+
+    def expected_body_len(self, usable):
+        hsz = 1 + 1 + 1 + 2                 # header size byte, NULL id, 4-char tag, 3,000-char body (2-byte serial)
+        psz = hsz + 4 + self.TEXT
+        return plcarve.local_payload(usable, psz) - hsz - 4
+
+    def test_local_payload_values_on_1024_pages(self):
+        self.assertEqual(plcarve.local_payload(1024, 989), 989)                # exactly X = U - 35
+        self.assertEqual(plcarve.local_payload(1024, 990), 103)                # K = 990 > X, so M = 103
+        self.assertEqual(plcarve.local_payload(1024, 2000), 103 + ((2000 - 103) % 1020))   # K = 980 <= X
+        self.assertEqual(plcarve.local_payload(1008, 3000), 101)               # reserved 16: M = 101, K = 992 > X = 973
+        self.assertNotEqual(plcarve.local_payload(1008, 3000), plcarve.local_payload(1024, 3000))
+
+    def test_carve_cuts_at_the_local_payload_of_a_1024_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recs, st = plcarve.carve_db(self.make(tmp))
+            self.assertEqual(st["page_size"], 1024)
+            longs = [r for r in recs if r.get("tag") in ("long", "lone")]
+            self.assertTrue(longs)
+            for r in longs:
+                self.assertEqual(r["overflow_lost"], "yes")
+                self.assertEqual(len(r["body"]), self.expected_body_len(1024))
+            for r in recs:
+                if r.get("tag") == "s":
+                    self.assertNotIn("overflow_lost", r)
+
+    def test_carve_honours_reserved_bytes_in_the_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.make(tmp)
+            shapes = plcarve.table_shapes(path)
+            data = bytearray(read_bytes(path))
+            data[20] = 16                       # 16 reserved bytes: usable = 1008
+            with open(path, "wb") as fh:
+                fh.write(data)
+            real = plcarve.table_shapes
+            plcarve.table_shapes = lambda *a, **k: shapes      # SQLite itself would call the patched page 1 corrupt
+            try:
+                recs, st = plcarve.carve_db(path)
+            finally:
+                plcarve.table_shapes = real
+            longs = [r for r in recs if r.get("tag") in ("long", "lone")]
+            self.assertTrue(longs, st)
+            self.assertNotEqual(self.expected_body_len(1008), self.expected_body_len(1024))
+            for r in longs:
+                self.assertEqual(len(r["body"]), self.expected_body_len(1008))
 
 
 class CarveNeverCrashes(unittest.TestCase):

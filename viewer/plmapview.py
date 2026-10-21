@@ -236,6 +236,10 @@ def elide_middle(text, n):
     return text[:head] + "\u2026" + text[len(text) - (keep - head):]
 
 
+# A cell starting with + or - stays as it is only when it is exactly a number: -5, -0.5, 3.14, +15550100.
+PLAIN_NUMBER = re.compile(r"-?[0-9]+(\.[0-9]+)?|\+[0-9]+")
+
+
 def csv_cell(x):
     """One CSV cell that Excel will show as text: no formulas, no NULs, no raw bytes."""
     if x is None:
@@ -243,7 +247,7 @@ def csv_cell(x):
     if isinstance(x, (bytes, bytearray, memoryview)):
         return f"<{len(bytes(x))} bytes>"
     s = str(x).replace("\x00", "")
-    if s[:1] in ("=", "@", "\t", "\r") or (s[:1] in ("+", "-") and s[1:2] and not s[1:2].isdigit()):
+    if s[:1] in ("=", "+", "-", "@", "\t", "\r") and not PLAIN_NUMBER.fullmatch(s):
         return "'" + s
     return s
 
@@ -495,8 +499,11 @@ class Viewer(tk.Tk):
         self.dev_combo.current(i)
         self._set_source(f"{label}  -  {self._shown(path)}")
         ok = sum(v["copy_matches"] == "yes" for v in self.ev.verify)
-        text = (f"Read-only COPIES in {self._shown(self.ev.work)}  |  {ok}/{len(self.ev.verify)} copies match "
-                f"their source SHA-256  |  the source folder is never opened by SQLite  |  "
+        na = sum(v["copy_matches"].startswith("n/a") for v in self.ev.verify)
+        checked = f"{ok}/{len(self.ev.verify) - na} copies match their source SHA-256"
+        if na:
+            checked += f" ({na} not checkable: source changed during copy)"
+        text = (f"Read-only COPIES in {self._shown(self.ev.work)}  |  {checked}  |  the source folder is never opened by SQLite  |  "
                 f"{len(self.g.relations)} relations, "
                 f"{sum(len(x) for x in self.g.edges.values()) // 2:,} links")
         stale = [] if self.redact else stale_copies(exclude=[self.ev.work] + ([self.pc.work] if self.pc else []))
@@ -538,6 +545,10 @@ class Viewer(tk.Tk):
             except OSError as e:
                 g.add_view(R.View("C_phones", "Phone connections", "conn", f"could not read: {e}", ["Error"],
                                   [{"Error": str(e)}]))
+            except BaseException:
+                if pc:
+                    self._remember(pc.close())      # the package copy made above would otherwise be leaked
+                raise
         return pc
 
     def _shown(self, path):
@@ -577,8 +588,13 @@ class Viewer(tk.Tk):
     def _fit_src(self):
         """Show the source line shortened in the middle so it fits the window width."""
         w = self.src_lbl.winfo_width()
-        chars = max(20, w // max(1, tkfont.Font(font=self.src_lbl.cget("font")).measure("0")) - 2) if w > 1 else 120
-        self.src_lbl.config(text=elide_middle(self.src_full, chars))
+        font = tkfont.Font(font=self.src_lbl.cget("font"))
+        chars = max(20, w // max(1, font.measure("0")) - 2) if w > 1 else 120
+        text = elide_middle(self.src_full, chars)
+        while w > 1 and chars > 20 and font.measure(text) > w:     # the "0" width is only an estimate: trim until it fits
+            chars -= 1
+            text = elide_middle(self.src_full, chars)
+        self.src_lbl.config(text=text)
 
     def _remember(self, leftover):
         if leftover:
@@ -815,7 +831,8 @@ class Viewer(tk.Tk):
             return
         devs = P.find_device_dirs(d)
         if not devs:
-            messagebox.showerror("No Phone Link databases", f"No Phone Link databases found under\n{d}")
+            messagebox.showerror("No Phone Link databases",
+                                 self._scrub(f"No Phone Link databases found under\n{self._shown(d)}"))
             return
         self.load_device(0, devices=devs)      # the old list, view and device stay if this one cannot be loaded
 
@@ -834,8 +851,9 @@ class Viewer(tk.Tk):
             self._status(f"Export FAILED - nothing was written to {name}: {self._why(e)}", warn=True)
             messagebox.showerror("Export failed", self._scrub(f"Could not write\n{name}\n\n{self._why(e)}"))
             return
-        self._status(f"Exported {len(self.cur_rows):,} rows to {name} - Excel-safe: cells that start with = @ + or - "
-                     f"are prefixed with ' so Excel shows them as text; bytes are written as <N bytes> "
+        self._status(f"Exported {len(self.cur_rows):,} rows to {name} - Excel-safe: a cell that starts with = + - @ "
+                     f"(or a tab or line break) gets a leading ' so Excel shows it as text, unless the whole cell is a "
+                     f"plain number such as -5, 3.14 or +15550100; bytes are written as <N bytes> "
                      f"(contains case data - keep local)")
 
     def report_callback_exception(self, exc, val, tb):
