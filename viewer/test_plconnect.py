@@ -225,8 +225,11 @@ class SmallFixes(unittest.TestCase):
         self.assertEqual(rows[0]["Address"], "00:00:5E:00:53:09")
 
     def test_dates_before_1970_do_not_raise(self):
-        self.assertEqual(C.local_to_utc("1969-12-31 23:00:00"), "")
-        self.assertEqual(C.local_to_utc("0001-01-01 00:00:00"), "")
+        # Windows cannot convert local times before 1970 and gives ""; Linux converts them. Either is fine,
+        # as long as nothing raises and the value is never garbage.
+        for s in ("1969-12-31 23:00:00", "0001-01-01 00:00:00"):
+            out = C.local_to_utc(s)
+            self.assertRegex(out, r"^(|\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)$")
         text = ">>>  [Device Install (Hardware initiated) - USB\\VID_1&PID_2\\X]\n>>>  Section start 1960/01/01 00:00:00.000\n"
         g = build_from(C.FakeSource({}, text))
         self.assertEqual(g.views["C_install"].rows[0]["FirstInstallLocal"], "1960-01-01 00:00:00")
