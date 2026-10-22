@@ -466,7 +466,8 @@ class WindowFixesTest(unittest.TestCase):
         f = lambda p: V.is_this_pc_package(p, base)
         self.assertTrue(f(pkg))
         self.assertTrue(f(os.path.join(pkg, "LocalCache", "Indexed")))
-        self.assertTrue(f(pkg.upper()))
+        if os.name == "nt":                       # Windows paths ignore case; Linux paths do not
+            self.assertTrue(f(pkg.upper()))
         self.assertFalse(f(os.path.join(base, "Temp", "case", "export")))
         self.assertFalse(f(base + "Low"))
         self.assertFalse(f(os.path.join(base + "Low", "Packages", "Microsoft.YourPhone_8wekyb3d8bbwe")))
