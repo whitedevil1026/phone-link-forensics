@@ -300,6 +300,7 @@ def build_edited(case, edits=None, **kw):
     src = pldemo.build(os.path.join(tmp, "device"))
     for db, stmts in (edits or {}).items():
         con = sqlite3.connect(os.path.join(src, db))
+        con.execute("PRAGMA secure_delete = OFF")  # keep deleted bytes: some SQLite builds (e.g. Ubuntu's) default to secure_delete ON
         for st in stmts:
             con.execute(*((st,) if isinstance(st, str) else st))
         con.commit()

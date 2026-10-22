@@ -183,6 +183,7 @@ def read_bytes(path):
 
 def make_deleted_notes(path, rows):
     c = sqlite3.connect(path)
+    c.execute("PRAGMA secure_delete = OFF")  # keep deleted bytes: some SQLite builds (e.g. Ubuntu's) default to secure_delete ON
     c.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, tag TEXT, body TEXT)")
     c.executemany("INSERT INTO notes (tag, body) VALUES (?, ?)", rows)
     c.commit()
@@ -252,6 +253,7 @@ class OverflowOtherPageSizes(unittest.TestCase):
     def make(self, folder):
         path = os.path.join(folder, "n.db")
         c = sqlite3.connect(path)
+        c.execute("PRAGMA secure_delete = OFF")  # keep deleted bytes: some SQLite builds (e.g. Ubuntu's) default to secure_delete ON
         c.execute("PRAGMA page_size=1024")
         c.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, tag TEXT, body TEXT)")
         c.executemany("INSERT INTO notes (tag, body) VALUES (?, ?)",
