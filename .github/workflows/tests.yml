@@ -2,7 +2,13 @@ name: tests
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Phone Link and the artifacts this tool reads exist only on Windows, so the tests run on Windows.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,5 +30,5 @@ jobs:
         run: python viewer/test_pldevices.py
       - name: Cable / Bluetooth connection tests
         run: python viewer/test_plconnect.py
-      - name: Viewer GUI tests (virtual display)
-        run: xvfb-run -a python viewer/test_plmapview.py
+      - name: Viewer GUI tests (Windows desktop)
+        run: python viewer/test_plmapview.py
